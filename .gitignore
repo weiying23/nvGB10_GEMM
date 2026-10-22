@@ -1,0 +1,8 @@
+# 编译产物与临时文件
+gemm_v0
+gemm_v1
+gemm_v2
+bench/bench_micro
+bench/cublas_bench
+*.o
+*.ptx
