@@ -84,29 +84,33 @@ __global__ void gemm_mma_v4(const bf16* __restrict__ A,
         else             cp_async_wait<0>();
         __syncthreads();
 
-        // A：16×16 一次
-        const int arow = warp_m * WM;
-        const int atile = lane / 8, ar8 = lane % 8;
-        uint32_t a[4];
-        uint32_t a_addr = (uint32_t)__cvta_generic_to_shared(
-            &As[s][arow + ar8 + (atile % 2) * 8][(atile / 2) * 8]);
-        asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                     : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(a_addr));
-
-        // NUM_MMA_N 个 mma（N 方向）
+        // 内层 K 循环：BK=16 时 1 次，BK=32 时 2 次，...（减少 barrier 次数的关键）
         #pragma unroll
-        for (int ni = 0; ni < NUM_MMA_N; ++ni) {
-            const int brow = warp_n * WN + ni * 8;
-            uint32_t b[2];
-            uint32_t b_addr = (uint32_t)__cvta_generic_to_shared(
-                &Bs[s][lane % 8 + (lane / 8 % 2) * 8][brow]);
-            asm volatile("ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0,%1}, [%2];\n"
-                         : "=r"(b[0]), "=r"(b[1]) : "r"(b_addr));
+        for (int ki = 0; ki < BK / 16; ++ki) {
+            // A：16×16，K 偏移 ki*16
+            const int arow = warp_m * WM;
+            const int atile = lane / 8, ar8 = lane % 8;
+            uint32_t a[4];
+            uint32_t a_addr = (uint32_t)__cvta_generic_to_shared(
+                &As[s][arow + ar8 + (atile % 2) * 8][(atile / 2) * 8 + ki * 16]);
+            asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                         : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(a_addr));
 
-            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                         : "+f"(c[ni][0]), "+f"(c[ni][1]), "+f"(c[ni][2]), "+f"(c[ni][3])
-                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+            // NUM_MMA_N 个 mma（N 方向）
+            #pragma unroll
+            for (int ni = 0; ni < NUM_MMA_N; ++ni) {
+                const int brow = warp_n * WN + ni * 8;
+                uint32_t b[2];
+                uint32_t b_addr = (uint32_t)__cvta_generic_to_shared(
+                    &Bs[s][lane % 8 + (lane / 8 % 2) * 8 + ki * 16][brow]);
+                asm volatile("ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0,%1}, [%2];\n"
+                             : "=r"(b[0]), "=r"(b[1]) : "r"(b_addr));
+
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                             : "+f"(c[ni][0]), "+f"(c[ni][1]), "+f"(c[ni][2]), "+f"(c[ni][3])
+                             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+            }
         }
         __syncthreads();
     }
@@ -174,12 +178,12 @@ int main(int argc, char** argv) {
         printf("%-14s %-8d %-8d %-10.2f %.2f%%\n", #BM "x" #BN "x" #BK, WN, (BM/16)*(BN/WN)*32, tf, tf/118.37*100); \
     } while(0)
 
-    EVAL(64,  32, 16, 16);   // 当前基线
-    EVAL(64,  64, 16, 32);   // 加大 BN
-    EVAL(64, 128, 16, 64);   // 再大 BN
-    EVAL(128, 64, 16, 16);   // 加大 BM
-    EVAL(128,128, 16, 32);   // BM+BN 都大
-    EVAL(128,256, 16, 64);   // 大 tile（WN=64 保持 1024 线程）
+    EVAL(64,  32, 16, 16);   // 基线
+    EVAL(64,  32, 32, 16);   // BK 翻倍
+    EVAL(64,  32, 64, 16);   // BK 四倍
+    EVAL(64,  64, 32, 32);
+    EVAL(64,  64, 64, 32);
+    EVAL(128,128, 32, 32);   // 大 tile + 大 BK
 
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
     return 0;
