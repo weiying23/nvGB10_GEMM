@@ -77,8 +77,6 @@ Step 4 验证（性能双百分比：峰值利用率 + 相对 cuBLAS；精度 vs
 | v6 | B 换 x4 ldmatrix / WN=32 | — | — | — | ❌ 假设证伪 |
 | **v7** | **照抄 cuBLAS 配置 + block swizzle** | **54.31** | **45.9%** | **62.4%** | ✅ |
 
-（8192³：v7 = 58.88 TFLOPS，cuBLAS 的 61.2%）
-
 ### 每一轮的瓶颈定位 → 结论
 
 **v0 → v1：算术强度太低（memory-bound）**
@@ -116,21 +114,12 @@ Step 4 验证（性能双百分比：峰值利用率 + 相对 cuBLAS；精度 vs
 | 策略 | **低 occupancy 换极高 ILP，摊薄 ldmatrix 延迟** | 高 occupancy 低 ILP |
 
 v7 配置：BM=128, BN=256, BK=32，8 warps（256 线程，2×4 排布），每 warp 64×64，3 stage，smem 72KB（dynamic）。
-再叠加 **block swizzle（GROUP_M=8）**：默认 n 优先调度下 B tile 复用距离太远（L2 24MB 装不下 64MB 数据），swizzle 组内 m 优先让 B tile 连续复用——8192³ 直接 +43%。
-
-### 核心方法论收获
+再叠加 **block swizzle（GROUP_M=8）**：默认 n 优先调度下 B tile 复用距离太远（L2 24MB 装不下 64MB 数据），swizzle 组内 m 优先让 B tile 连续复用——8192³ 直接 +43%。### 核心方法论收获
 
 1. **消融探针是定位指令级瓶颈的唯一手段**（本机 ncu counter 权限被锁）：逐项排除法最终定位到「ldsm 延迟依赖」，这是 Roofline 完全看不到的一层；
 2. **nsys 抓 kernel 名 = 看到标准答案**：cuBLAS 的 kernel 名直接暴露了 tile/stage 配置；
 3. **探针结论不能直接外推**：探针隔离单一变量，真实 kernel 有耦合副作用（v6 的教训）；
 4. **每轮实测、不预设结论**：v4/v5/v6 三次推翻假设恰是这套流程的价值——失败也被记录、被证伪、沉淀成下一步依据。
-
-## 距 cuBLAS 还差的 ~38%
-
-1. ~~block swizzle~~ ✅ 已做（8192³ +43%）
-2. 3-stage 的同步调度细节（CUTLASS 用 NamedBarrier 细分）
-3. 小形状多 tile 配置（autotune；512³ 因 grid 太小只有 6 TFLOPS）
-4. TMA 加载（8192³ 的 nvjet kernel 用 `tmaAB`，我们的 cp.async 走 LSU 与 ldsm 抢占）
 
 ## 目录结构
 
