@@ -9,3 +9,4 @@ bench/cublas_bench
 gemm_v3
 gemm_v4
 gemm_v5
+gemm_v7
