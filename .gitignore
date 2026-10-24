@@ -6,3 +6,6 @@ bench/bench_micro
 bench/cublas_bench
 *.o
 *.ptx
+gemm_v3
+gemm_v4
+gemm_v5
