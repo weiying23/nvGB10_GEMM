@@ -41,6 +41,25 @@ __global__ void __launch_bounds__(256, 1) gemm_mma_v7(const bf16* __restrict__ A
                             const bf16* __restrict__ B,
                             float* __restrict__ C,
                             int M, int N, int K) {
+    // ---- block swizzle（L2 复用调度）----
+    // 默认调度 n 优先：B 的 tile 要跨 num_n_blocks 个 block 才被复用，L2 装不下。
+    // swizzle 后组内 m 优先：同一 n 的 B tile 被 GROUP_M 个 m 连续使用，L2 命中。
+    constexpr uint32_t GROUP_M = 8;
+    const uint32_t num_m_blocks = (M + BM - 1) / BM;
+    const uint32_t num_n_blocks = (N + BN - 1) / BN;
+    const uint32_t bid = blockIdx.x;
+    const uint32_t group_size = GROUP_M * num_n_blocks;
+    const uint32_t group_id = bid / group_size;
+    const uint32_t in_group = bid % group_size;
+    const uint32_t m_first = min(group_id * GROUP_M, num_m_blocks);
+    const uint32_t m_g = min(GROUP_M, num_m_blocks - m_first);
+    const uint32_t m_block_idx = m_first + in_group % m_g;
+    const uint32_t n_block_idx = in_group / m_g;
+    if (n_block_idx >= num_n_blocks) return;
+
+    const int block_m = m_block_idx * BM;
+    const int block_n = n_block_idx * BN;
+
     extern __shared__ __align__(1024) uint8_t smem_raw[];
     bf16 (*As)[BM][BK] = reinterpret_cast<bf16 (*)[BM][BK]>(smem_raw);
     bf16 (*Bs)[BK][BN] = reinterpret_cast<bf16 (*)[BK][BN]>(smem_raw + NUM_STAGES * sizeof(bf16) * BM * BK);
@@ -50,8 +69,6 @@ __global__ void __launch_bounds__(256, 1) gemm_mma_v7(const bf16* __restrict__ A
     const int lane = tid % 32;
     const int warp_m = warp / 4;   // 0..1（M 方向 2 段）
     const int warp_n = warp % 4;   // 0..3（N 方向 4 段）
-    const int block_m = blockIdx.y * BM;
-    const int block_n = blockIdx.x * BN;
 
     constexpr int AS_BLOCKS = BM * BK / 8;      // 512
     constexpr int BS_BLOCKS = BK * BN / 8;      // 1024
@@ -183,7 +200,9 @@ int main(int argc, char** argv) {
     CK(cudaFuncSetAttribute(gemm_mma_v7, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
 
     dim3 block(256);
-    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+    const uint32_t num_m_blocks = (M + BM - 1) / BM;
+    const uint32_t num_n_blocks = (N + BN - 1) / BN;
+    dim3 grid(num_m_blocks * num_n_blocks);   // 1D grid，kernel 内 swizzle
 
     const int iters = 10;
     for (int i = 0; i < 3; ++i) gemm_mma_v7<<<grid, block, SMEM_BYTES>>>(dA, dB, dC, M, N, K);
