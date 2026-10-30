@@ -14,26 +14,26 @@ GB10 不是独立显卡，是 **Grace-Blackwell 风格的 SoC**：ARM CPU 与 GP
 ┌─────────────────────────────────────────────────────────────────┐
 │                        GB10 SoC                                  │
 │                                                                  │
-│   ┌──────────────┐         ┌────────────────────────────────┐   │
-│   │  ARM CPU 核   │         │         GPU（本档主角）          │   │
-│   │  (Grace 系)   │         │                                │   │
-│   └──────┬───────┘         │   ┌────┐ ┌────┐     ┌────┐      │   │
-│          │                 │   │SM 0│ │SM 1│ ... │SM47│ 48个 │   │
-│          │                 │   └──┬─┘ └──┬─┘     └──┬─┘      │   │
-│          │                 │      └──────┼───────────┘        │   │
-│          │                 │             │  交叉开关/NoC       │   │
-│          │                 └─────────────┼────────────────────┘   │
-│          │                               │                        │
-│   ┌──────┴───────────────────────────────┴────────────────┐       │
-│   │              LPDDR5X 统一内存 128 GB                    │       │
-│   │   8533 MHz 有效 × 256-bit 总线 = 273 GB/s 理论 [官方]    │       │
-│   │   GPU 可见 121.69 GB（其余为系统保留）[驱动报告]          │       │
-│   └───────────────────────────────────────────────────────┘       │
+│   ┌──────────────┐  NVLink-C2C  ┌────────────────────────────┐   │
+│   │  ARM CPU 核   │◄════════════►│        GPU（本档主角）        │   │
+│   │  (Grace 系)   │   [官方]     │                            │   │
+│   └──────┬───────┘              │   ┌────┐ ┌────┐   ┌────┐    │   │
+│          │                      │   │SM 0│ │SM 1│ … │SM47│ 48个│   │
+│          │                      │   └──┬─┘ └──┬─┘   └──┬─┘    │   │
+│          │                      │      └──────┼─────────┘      │   │
+│          │                      └─────────────┼────────────────┘   │
+│          │                                    │ 交叉开关/NoC         │
+│   ┌──────┴────────────────────────────────────┴───────┐           │
+│   │              LPDDR5X 统一内存 128 GB               │           │
+│   │   8533 MHz 有效 × 256-bit 总线 = 273 GB/s 理论 [官方] │           │
+│   │   GPU 可见 121.69 GB（其余为系统保留）[驱动报告]       │           │
+│   └───────────────────────────────────────────────────┘           │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 **要点**：
-- 统一内存 = CPU/GGPU 共享物理内存。带宽 273 GB/s 是**整个 SoC 共享的单向峰值**——比数据中心卡（HBM，数 TB/s）低一个数量级，这决定了本机 GEMM 的 roofline 转折点极高（463 FLOP/byte，见 §6）。
+- **CPU↔GPU 互连 = NVLink-C2C**（Grace 风格一致性互连，官方规格；本机未单独实测其带宽）。注意：**没有 GPU↔GPU 的 NVLink**（不能多卡扩展）。
+- 统一内存 = CPU/GPU 共享物理内存。带宽 273 GB/s 是**整个 SoC 共享的单向峰值**——比数据中心卡（HBM，数 TB/s）低一个数量级，这决定了本机 GEMM 的 roofline 转折点极高（463 FLOP/byte，见 §6）。
 - 实测读带宽 **253.5~255.6 GB/s**（理论值的 93%）`[实测, bench/bench_micro.cu]`。
 
 ---
@@ -41,7 +41,7 @@ GB10 不是独立显卡，是 **Grace-Blackwell 风格的 SoC**：ARM CPU 与 GP
 ## 2. GPU 核心：48 个 SM
 
 ```
-GPU（cc 12.1，消费级 Blackwell，无 NVLink）
+GPU（cc 12.1，消费级 Blackwell；第五代 Tensor Core；无 GPU 间 NVLink）
 │
 ├── SM 0  ── L1/smem 100KB ── 寄存器堆 64K×32bit
 ├── SM 1  ── 同上
@@ -52,6 +52,17 @@ GPU（cc 12.1，消费级 Blackwell，无 NVLink）
     ├── L2 cache：24 MB（分区/切片组成，跨 SM 一致）
     └── 内存控制器 → LPDDR5X
 ```
+
+### 核心数量
+
+| 项目 | 数量 | 来源与说明 |
+|---|---|---|
+| SM | **48** | [驱动报告] |
+| CUDA core | 外部口径 **6144**（128/SM） | [未验证] 与本机实测不一致，见下 |
+| FP32 FMA 数据通路 | **实测 64 FMA/clk/SM = 全 GPU 3072 条** | [实测：16 独立链 FFMA 满载 15.23 TFLOPS @ 实抓 2411 MHz] |
+| Tensor core | 官方未公布；按消费级 Blackwell SM 结构**推断 4 个/SM = 192 个** | [推断] |
+
+> ⚠️ **CUDA core 口径分歧**：外部资料（含评价方）称 6144（=48×128），但本机实测 FP32 FFMA 吞吐只有 64 FMA/clk/SM（若为 128 条 lane/SM，2.4 GHz 下应测得 ~29.5 TFLOPS，实测仅 15.23 且时钟确认为 2411 MHz 满载、16 独立链排除了依赖链限制）。可能官方计数含 FP32/INT32 复用管线或其他口径。**本项目的 roofline 一律以实测 64 FMA/clk/SM 为准。**
 
 | 参数 | 值 | 来源 |
 |---|---|---|
@@ -88,10 +99,10 @@ ncu 计数器被权限锁定（`ERR_NVGPUCTRPERM`），子分区细节无法直�
 │                             │  每 子 分 区：             │ │
 │                             │  · FP32 FMA 阵列          │ │
 │                             │    (全 SM 合计 64 FMA/clk  │ │
-│                             │     [实测推导]，张量核为    │ │
+│                             │     [实测]，张量核为    │ │
 │                             │     其 8 倍吞吐)           │ │
-│                             │  · 第 4 代张量核            │ │
-│                             │    (仅 mma.sync 家族)      │ │
+│                             │  · 第五代张量核（5th-gen；指令面仅 mma.sync 家族，见 §6）            │ │
+│                             │    (指令面仅 mma.sync 家族) │ │
 │                             │  · LSU（ld/ldsm/st）       │ │
 │                             │  · SFU（超越函数等）        │ │
 │                             └──────────────────────────┘ │
@@ -113,13 +124,17 @@ ncu 计数器被权限锁定（`ERR_NVGPUCTRPERM`），子分区细节无法直�
 
 | 运算 | FLOP/clk/SM | 全 GPU | 测量方式 |
 |---|---|---|---|
+| **FP8** `mma.sync.m16n8k32`（e4m3/e5m2） | **2048**（=1024 FMA） | **235.79 TFLOPS** | 8 独立累加器 ILP 压满 [实测] |
 | BF16 `mma.sync.m16n8k16` | **1024**（=512 FMA） | **118.37 TFLOPS** | 8 独立累加器 ILP 压满 [实测] |
 | TF32 `mma.sync.m16n8k8` | **512** | **58.95 TFLOPS** | 同上 [实测] |
-| FP32 FFMA（CUDA core） | **128**（=64 FMA） | **13.7~14.8 TFLOPS** | PTX fma 4 独立链 [实测] |
+| FP32 FFMA（CUDA core） | **128**（=64 FMA） | **15.23 TFLOPS** | PTX fma 16 独立链 @ 实抓 2411 MHz [实测] |
 | FP64 | ~4 | ~0.23 TFLOPS | 官方比值 64:1 [推导，未实测] |
 | smem → 寄存器（ldsm） | — | 130 TB/s 聚合 | v5 消融探针 [实测] |
 
-**结构结论**：张量核是 FP32 CUDA core 的 **8 倍**吞吐（1024 vs 128 FLOP/clk/SM）——任何没上 `mma.sync` 的 kernel 最多只能拿到 1/8 算力（本项目 v1→v2 的 3.4× 跳变即源于此）。
+**说明**：
+- 上表全部是 **mma.sync 指令路径的微基准结果**，不是官方营销峰值。官方仅公布 FP4 稀疏口径（约 1 PFLOP/s），按 8× 换算 BF16 稠密理论值 ≈ 125 TFLOPS，与实测 118.37 吻合（94.7%）。
+- FP32 的 4 独立链测法只得 13.76（依赖链限制），16 独立链才是通路饱和值 15.23。
+- **结构结论**：张量核 BF16 路径 = FP32 数据通路的 **8 倍**吞吐（1024 vs 128 FLOP/clk/SM），FP8 再翻倍（**16 倍**，2048）——任何没上 `mma.sync` 的 kernel 最多只能拿到 1/8 算力（本项目 v1→v2 的 3.4× 跳变即源于此）；而 FP8 相对 BF16 有整整 2× 的免费加成空间（若精度允许）。
 
 ---
 
@@ -196,21 +211,22 @@ DRAM        128 GB (LPDDR5X)     ~400 ns [实测]   253~256 GB/s [实测]
 ### 有（可用）
 | 能力 | 说明 | 验证方式 |
 |---|---|---|
-| `mma.sync.m16n8k16` BF16/FP16 | **唯一**的张量核指令形态；TF32 是 m16n8k8 | v2 起全版本使用 |
+| `mma.sync.m16n8k16` BF16/FP16 | 张量核主力指令形态；TF32 是 m16n8k8 | v2 起全版本使用 |
+| **`mma.sync.m16n8k32` FP8（e4m3/e5m2）** | **实测 235.79 TFLOPS = BF16 的 2 倍**；精度换吞吐的空间 | 编译探针（sm_121 通过）+ 微基准实测 |
 | `ldmatrix`（x4 / x2.trans） | smem→寄存器，专为 mma 供操作数 | v2 dump 逐位验证布局 |
 | `cp.async`（16B） | Ampere 风格异步拷贝 | v3~v7 使用 |
 | TMA `cp.async.bulk.tensor.2d` | 一条指令搬整个 tile，需 `-lcuda` + `__grid_constant__ CUtensorMap`；越界自动补 0 | v8 使用 |
 | `mbarrier` + `try_wait.parity` | full/empty 障栅（**但有 §7 怪癖**） | v8 使用 |
 | 协作 launch / 集群 launch | persistent kernel 的前提 | 驱动报告 |
 
-### 没有（试过/查过，不存在）
-| 能力 | 影响 |
-|---|---|
-| **tcgen05 / TMEM / WGMMA（sm_90 风格）** | 不能用 Hopper/数据中心 Blackwell 的第五代张量核编程模型 |
-| **FP8 / FP4 mma（mma.sync 形态）** | 只有 BF16/FP16/TF32/INT 路线 |
-| warp 专属 TMA（producer warp 独立跑 producer pipeline 的 sm_90 完整语义） | 未验证完整语义，v8 用 thread 0 兼任 producer |
+### 没有（ptxas 编译探针确认）
+| 能力 | 证据 | 影响 |
+|---|---|---|
+| **tcgen05 / TMEM** | ptxas 报错 `Instruction 'tcgen05.alloc' not supported on .target 'sm_121'` | 不能用数据中心 Blackwell 的第五代张量核编程模型 |
+| **WGMMA** | sm_90a 专属指令族，sm_121 编译失败 | 不能用 Hopper 异步张量 warp-group mma |
+| FP4（e2m1）mma.sync | **未验证**——所测 PTX 语法在 sm_120（RTX 50 系）上同样编译失败，说明语法未写对，无法据此下结论 | 若存在则还有 2× 空间，待找到正确语法后重测 |
 
-→ **本芯片的 GEMM 天花板 = Ampere 风格 mma.sync 流水**。cuBLAS 同样受限：4096³ 用的就是 `cutlass_80_tensorop_bf16_s16816gemm_128x256_32x3`（sm80 kernel，nsys 抓包 [实测]），跑出 87.1 TFLOPS = 峰值的 74%。
+→ **本芯片的 GEMM 指令面 = Ampere 风格 mma.sync 流水**（张量核硬件是第五代，但只暴露 mma.sync 指令模型）。cuBLAS 同样受限：4096³ 用的就是 `cutlass_80_tensorop_bf16_s16816gemm_128x256_32x3`（sm80 kernel，nsys 抓包 [实测]），跑出 87.1 TFLOPS = BF16 峰值的 74%。**若走 FP8 路线，峰值可达 235.79 TFLOPS（本项目尚未做 FP8 GEMM）。**
 
 ---
 
@@ -254,9 +270,11 @@ L2 延迟 143ns ────────→ TMA 预取 2 级 lookahead（3.2μs�
 | 数据 | 方法 | 文件 |
 |---|---|---|
 | BF16/TF32 峰值 | 8 独立累加器 mma 循环，满载时钟 2405 MHz 下计时 | `bench/bench_micro.cu` |
-| FP32 峰值 | PTX `fma.rn.f32` × 4 独立链（nvcc 内建 fmaf 会被优化掉，数字虚高一倍） | /tmp/opencode/ffma2.cu |
+| FP8 峰值 | 8 独立累加器 `mma.sync.m16n8k32.e4m3` 循环 | /tmp/opencode/peak_fp8.cu |
+| FP32 峰值 | PTX `fma.rn.f32` × **16** 独立链（4 链只有 13.76，是依赖链限制非通路极限；nvcc 内建 fmaf 会被优化掉） | /tmp/opencode/ffma16b.cu |
+| 指令支持（FP8/FP4/tcgen05/WGMMA） | 编译探针：各写最小 asm 用例，`nvcc -arch=sm_121/120/89/90` 交叉验证语法有效性（**必须看具体报错文本，只数 error 行数曾导致 FP8 误判为不支持**） | /tmp/opencode/isa_probe.cu |
 | DRAM/L2 延迟 | 单线程随机置换指针追逐（8MB→L2，512MB→DRAM） | /tmp/opencode/lat.cu |
 | L2 带宽 | ≤L2 容量 buffer × 48×32 blocks 反复读 | /tmp/opencode/l2bw.cu |
 | DRAM 带宽 | 1GB grid-stride float4 读 | `bench/bench_micro.cu` |
-| smem 带宽 | v5 消融探针纯 ldsm | `bench/probe_*.cu`（v5 时代） |
+| smem 带宽 | v5 消融探针纯 ldsm（微基准聚合吞吐，非硬件规格值） | `bench/probe_*.cu`（v5 时代） |
 | 时钟 | 满载 kernel 运行中 nvidia-smi 轮询（每 0.4s） | — |
