@@ -62,7 +62,7 @@ Step 4 验证（性能双百分比：峰值利用率 + 相对 cuBLAS；精度 vs
 
 两个铁律：**所有性能数字以压测为准，禁止推测**；**精度参照 = 同精度 cuBLAS**（不是 FP32 真值）。
 
-## V1–V7 优化轨迹
+## V1–V8 优化轨迹
 
 ### 成绩总览（4096³，同机实测）
 
@@ -76,6 +76,7 @@ Step 4 验证（性能双百分比：峰值利用率 + 相对 cuBLAS；精度 vs
 | v5 | 加大 BK / 4-stage 多缓冲 | — | — | — | ❌ 假设证伪 |
 | v6 | B 换 x4 ldmatrix / WN=32 | — | — | — | ❌ 假设证伪 |
 | **v7** | **照抄 cuBLAS 配置 + block swizzle** | **54.31** | **45.9%** | **62.4%** | ✅ |
+| **v8** | **TMA + mbarrier full/empty（零 `__syncthreads`）** | **59.2** | **50.0%** | **68.0%** | ✅（含 race 修复勘误） |
 
 ### 每一轮的瓶颈定位 → 结论
 
@@ -114,7 +115,16 @@ Step 4 验证（性能双百分比：峰值利用率 + 相对 cuBLAS；精度 vs
 | 策略 | **低 occupancy 换极高 ILP，摊薄 ldmatrix 延迟** | 高 occupancy 低 ILP |
 
 v7 配置：BM=128, BN=256, BK=32，8 warps（256 线程，2×4 排布），每 warp 64×64，3 stage，smem 72KB（dynamic）。
-再叠加 **block swizzle（GROUP_M=8）**：默认 n 优先调度下 B tile 复用距离太远（L2 24MB 装不下 64MB 数据），swizzle 组内 m 优先让 B tile 连续复用——8192³ 直接 +43%。### 核心方法论收获
+再叠加 **block swizzle（GROUP_M=8）**：默认 n 优先调度下 B tile 复用距离太远（L2 24MB 装不下 64MB 数据），swizzle 组内 m 优先让 B tile 连续复用——8192³ 直接 +43%。
+
+**v7 → v8：sync-bound → TMA + mbarrier 流水（+8.5%）**
+
+- v7 配置消融探针：纯 mma 115.7 → +ldsm 106.0 → **+1×`__syncthreads` 70.8（-33%，主瓶颈）**——1 block/SM 下 barrier 期间整个 SM 空转；
+- v8 用 mbarrier full/empty 双 barrier 替代全部 `__syncthreads`（producer=thread 0 发 TMA，consumer=warp leader 释放），4096³ 54.57→59.2；
+- **勘误（2026-10-30）**：v8 首次提交的 61.76 带间歇性 race（GB10 上 `mbarrier.arrive` 隐式 release 不保证先前 LDSM 读完成，TMA 过早覆写 stage），需显式 `fence.acq_rel.cta` 修复（代价约 -4%）。修复后全尺寸 0 误差。**race 版数字全部作废**；
+- 4-stage 探针：+1.6%（噪声内）不采纳，TMA 到货延迟假设关闭。剩余 ~47 差距主嫌疑：mbarrier 自旋开销、epilogue 串行、grid 尾波。
+
+### 核心方法论收获
 
 1. **消融探针是定位指令级瓶颈的唯一手段**（本机 ncu counter 权限被锁）：逐项排除法最终定位到「ldsm 延迟依赖」，这是 Roofline 完全看不到的一层；
 2. **nsys 抓 kernel 名 = 看到标准答案**：cuBLAS 的 kernel 名直接暴露了 tile/stage 配置；
@@ -125,10 +135,11 @@ v7 配置：BM=128, BN=256, BK=32，8 warps（256 线程，2×4 排布），每 
 
 ```
 criterion.md        优化守则（四步循环 + 双百分比判定 + 精度标准）
-gemm_v0.cu ~ v7.cu  8 个版本的 GEMM 实现（每个可独立编译运行）
-reports/v0.md~v7.md 每版结论文档（瓶颈→方案→实测→教训）
+gemm_v0.cu ~ v8.cu  9 个版本的 GEMM 实现（每个可独立编译运行）
+reports/v0.md~v8.md 每版结论文档（瓶颈→方案→实测→教训）
 bench/bench_micro.cu    峰值算力/带宽压测（标定 100% 标尺）
 bench/cublas_bench.cu   cuBLAS baseline（性能参照）
+bench/probe_v7cfg.cu    v7 配置消融探针（mma/ldsm/sync 逐项排除）
 ```
 
 ## License
