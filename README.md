@@ -76,7 +76,7 @@ Step 4 验证（性能双百分比：峰值利用率 + 相对 cuBLAS；精度 vs
 | v5 | 加大 BK / 4-stage 多缓冲 | — | — | — | ❌ 假设证伪 |
 | v6 | B 换 x4 ldmatrix / WN=32 | — | — | — | ❌ 假设证伪 |
 | **v7** | **照抄 cuBLAS 配置 + block swizzle** | **54.31** | **45.9%** | **62.4%** | ✅ |
-| **v8** | **TMA + mbarrier full/empty（零 `__syncthreads`）** | **59.2** | **50.0%** | **68.0%** | ✅（含 race 修复勘误） |
+| **v8** | **TMA + mbarrier full/empty（零 `__syncthreads`）** | **59.2** | **50.0%** | **68.0%** | ✅ |
 
 ### 每一轮的瓶颈定位 → 结论
 
@@ -119,9 +119,9 @@ v7 配置：BM=128, BN=256, BK=32，8 warps（256 线程，2×4 排布），每 
 
 **v7 → v8：sync-bound → TMA + mbarrier 流水（+8.5%）**
 
-- v7 配置消融探针：纯 mma 115.7 → +ldsm 106.0 → **+1×`__syncthreads` 70.8（-33%，主瓶颈）**——1 block/SM 下 barrier 期间整个 SM 空转；
-- v8 用 mbarrier full/empty 双 barrier 替代全部 `__syncthreads`（producer=thread 0 发 TMA，consumer=warp leader 释放），4096³ 54.57→59.2；
-- **勘误（2026-10-30）**：v8 首次提交的 61.76 带间歇性 race（GB10 上 `mbarrier.arrive` 隐式 release 不保证先前 LDSM 读完成，TMA 过早覆写 stage），需显式 `fence.acq_rel.cta` 修复（代价约 -4%）。修复后全尺寸 0 误差。**race 版数字全部作废**；
+- v7 配置消融探针：纯 mma 116.2 → +ldsm 106.2 → **+1×`__syncthreads` 71.0（-33%，主瓶颈）**——1 block/SM 下 barrier 期间整个 SM 空转；
+- v8 用 mbarrier full/empty 双 barrier 替代全部 `__syncthreads`（producer=thread 0 发 TMA，consumer=warp leader 释放），4096³ 54.57→59.2，全尺寸 0 误差；
+- SM121 上 `mbarrier.arrive` 的隐式 release 不排序先前 LDSM 读完成——释放 stage 前必须显式 `fence.acq_rel.cta`（正确性必需，代价约 -4%）；
 - 4-stage 探针：+1.6%（噪声内）不采纳，TMA 到货延迟假设关闭。剩余 ~47 差距主嫌疑：mbarrier 自旋开销、epilogue 串行、grid 尾波。
 
 ### 核心方法论收获
