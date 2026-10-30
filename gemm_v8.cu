@@ -29,7 +29,10 @@ using bf16 = __nv_bfloat16;
 #define BK 32
 #define WM 64
 #define WN 64
+// stage 数可用 -DNUM_STAGES=4 覆盖（探针实验用）
+#ifndef NUM_STAGES
 #define NUM_STAGES 3
+#endif
 #define NUM_M 4
 #define NUM_N 8
 #define TMA_BYTES_PER_STAGE (sizeof(bf16) * (BM * BK + BK * BN))
@@ -132,37 +135,35 @@ __global__ void __launch_bounds__(256, 1) gemm_v8(
 
     const int num_k_blocks = (K + BK - 1) / BK;
 
-    // ---- prologue：预取 stage 0, 1（首次使用，不需要等 empty）----
+    // ---- prologue：预取 stage 0..NUM_STAGES-2（首次使用，不需要等 empty）----
     if (tid == 0) {
-        if (num_k_blocks > 0) {
-            mbar_arrive_expect_tx(&full_bar[0], TMA_BYTES_PER_STAGE);
-            tma_load_2d(&tma_a, As[0], &full_bar[0], 0, block_m);
-            tma_load_2d(&tma_b, Bs[0], &full_bar[0], block_n, 0);
-        }
-        if (num_k_blocks > 1) {
-            mbar_arrive_expect_tx(&full_bar[1], TMA_BYTES_PER_STAGE);
-            tma_load_2d(&tma_a, As[1], &full_bar[1], BK, block_m);
-            tma_load_2d(&tma_b, Bs[1], &full_bar[1], block_n, BK);
+        #pragma unroll
+        for (int i = 0; i < NUM_STAGES - 1; ++i) {
+            if (num_k_blocks > i) {
+                mbar_arrive_expect_tx(&full_bar[i], TMA_BYTES_PER_STAGE);
+                tma_load_2d(&tma_a, As[i], &full_bar[i], i * BK, block_m);
+                tma_load_2d(&tma_b, Bs[i], &full_bar[i], block_n, i * BK);
+            }
         }
     }
 
-    uint32_t phase[NUM_STAGES] = {0, 0, 0};
-    uint32_t prod_empty_phase[NUM_STAGES] = {0, 0, 0};  // producer 侧 empty phase（只 tid==0 使用）
+    uint32_t phase[NUM_STAGES] = {0};
+    uint32_t prod_empty_phase[NUM_STAGES] = {0};  // producer 侧 empty phase（只 tid==0 使用）
 
     // ---- 主循环（零 __syncthreads）----
     for (int k = 0; k < num_k_blocks; ++k) {
         const int s = k % NUM_STAGES;
 
-        // ① 预取 stage (k+2)%3（thread 0：等 empty → TMA → arrive full）
-        if (tid == 0 && k + 2 < num_k_blocks) {
-            int next_s = (k + 2) % NUM_STAGES;
-            if (k >= 1) {  // stage 复用时才需要等 empty（首次使用不需要）
+        // ① 预取 stage (k+NUM_STAGES-1)%NUM_STAGES（thread 0：等 empty → TMA → arrive full）
+        if (tid == 0 && k + NUM_STAGES - 1 < num_k_blocks) {
+            int next_s = (k + NUM_STAGES - 1) % NUM_STAGES;
+            if (k >= 1) {  // stage 复用时才需要等 empty（首次使用不需要；对任意 NUM_STAGES 成立）
                 mbar_wait(&empty_bar[next_s], prod_empty_phase[next_s]);
                 prod_empty_phase[next_s] ^= 1;
             }
             mbar_arrive_expect_tx(&full_bar[next_s], TMA_BYTES_PER_STAGE);
-            tma_load_2d(&tma_a, As[next_s], &full_bar[next_s], (k + 2) * BK, block_m);
-            tma_load_2d(&tma_b, Bs[next_s], &full_bar[next_s], block_n, (k + 2) * BK);
+            tma_load_2d(&tma_a, As[next_s], &full_bar[next_s], (k + NUM_STAGES - 1) * BK, block_m);
+            tma_load_2d(&tma_b, Bs[next_s], &full_bar[next_s], block_n, (k + NUM_STAGES - 1) * BK);
         }
 
         // ② 等当前 stage 数据就绪（mbarrier full）
@@ -212,6 +213,9 @@ __global__ void __launch_bounds__(256, 1) gemm_v8(
                     }
 
         // ④ consumer 释放当前 stage（warp leader arrive on empty barrier）
+        // 关键修复：GB10 上 mbarrier.arrive 的隐式 release 不足以排序先前 LDSM 读的完成，
+        // TMA 可在 ldsm 数据返回前覆写 stage —— 必须显式 fence（实验 5/6 定位，见 reports/v8.md）
+        asm volatile("fence.acq_rel.cta;\n");
         if (lane == 0) mbar_arrive(&empty_bar[s]);
     }
 
