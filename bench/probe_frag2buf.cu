@@ -1,4 +1,4 @@
-// gemm_v9.cu —— v9：v8 + 片段寄存器双缓冲（ldsm 提前一拍，被 mma 覆盖）
+// probe_frag2buf.cu —— v9：v8 + 片段寄存器双缓冲（ldsm 提前一拍，被 mma 覆盖）
 //
 // Roofline 依据（v7 分析）：v7 完全不是 DRAM-bound（t_v7/t_DRAM_min = 5~2300×），
 // 46% 算力在等 LSU 争抢（cp.async 6×LDGSTS/线程）+ 同步阻塞（2×__syncthreads/K块）。
@@ -74,7 +74,7 @@ __device__ __forceinline__ void tma_load_2d(const void* tmap, void* smem_dst,
         :: "r"(s), "l"(tmap), "r"(x), "r"(y), "r"(m));
 }
 
-__global__ void __launch_bounds__(256, 1) gemm_v9(
+__global__ void __launch_bounds__(256, 1) probe_frag2buf(
     const __grid_constant__ CUtensorMap tma_a,
     const __grid_constant__ CUtensorMap tma_b,
     float* __restrict__ C,
@@ -311,7 +311,7 @@ int main(int argc, char** argv) {
 
     constexpr int SMEM_BYTES = NUM_STAGES * sizeof(bf16) * (BM * BK + BK * BN)
                              + 2 * NUM_STAGES * sizeof(uint64_t);  // full + empty mbarriers
-    CK(cudaFuncSetAttribute(gemm_v9, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
+    CK(cudaFuncSetAttribute(probe_frag2buf, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
 
     const uint32_t num_m_blocks = (M + BM - 1) / BM;
     const uint32_t num_n_blocks = (N + BN - 1) / BN;
@@ -319,12 +319,12 @@ int main(int argc, char** argv) {
     dim3 grid(num_m_blocks * num_n_blocks);
 
     const int iters = 10;
-    for (int i = 0; i < 3; ++i) gemm_v9<<<grid, block, SMEM_BYTES>>>(tmap_a, tmap_b, dC, M, N, K);
+    for (int i = 0; i < 3; ++i) probe_frag2buf<<<grid, block, SMEM_BYTES>>>(tmap_a, tmap_b, dC, M, N, K);
     CK(cudaDeviceSynchronize());
 
     cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
     cudaEventRecord(s);
-    for (int i = 0; i < iters; ++i) gemm_v9<<<grid, block, SMEM_BYTES>>>(tmap_a, tmap_b, dC, M, N, K);
+    for (int i = 0; i < iters; ++i) probe_frag2buf<<<grid, block, SMEM_BYTES>>>(tmap_a, tmap_b, dC, M, N, K);
     cudaEventRecord(e); cudaEventSynchronize(e);
     float ms = 0; cudaEventElapsedTime(&ms, s, e); ms /= iters;
 
