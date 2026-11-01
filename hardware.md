@@ -34,7 +34,7 @@ GB10 不是独立显卡，是 **Grace-Blackwell 风格的 SoC**：ARM CPU 与 GP
 **要点**：
 - **CPU↔GPU 互连 = NVLink-C2C**（Grace 风格一致性互连，官方规格；本机未单独实测其带宽）。注意：**没有 GPU↔GPU 的 NVLink**（不能多卡扩展）。
 - 统一内存 = CPU/GPU 共享物理内存。带宽 273 GB/s 是**整个 SoC 共享的单向峰值**——比数据中心卡（HBM，数 TB/s）低一个数量级，这决定了本机 GEMM 的 roofline 转折点极高（463 FLOP/byte，见 §6）。
-- 实测读带宽 **253.5~255.6 GB/s**（理论值的 93%）`[实测, bench/bench_micro.cu]`。
+- 实测读带宽 **253.5–255.6 GB/s**（理论值的 93%）`[实测, bench/bench_micro.cu]`。
 
 ---
 
@@ -62,7 +62,7 @@ GPU（cc 12.1，消费级 Blackwell；第五代 Tensor Core；无 GPU 间 NVLink
 | FP32 FMA 数据通路 | **实测 64 FMA/clk/SM = 全 GPU 3072 条** | [实测：16 独立链 FFMA 满载 15.23 TFLOPS @ 实抓 2411 MHz] |
 | Tensor core | 官方未公布；按消费级 Blackwell SM 结构**推断 4 个/SM = 192 个** | [推断] |
 
-> ⚠️ **CUDA core 口径分歧**：外部资料（含评价方）称 6144（=48×128），但本机实测 FP32 FFMA 吞吐只有 64 FMA/clk/SM（若为 128 条 lane/SM，2.4 GHz 下应测得 ~29.5 TFLOPS，实测仅 15.23 且时钟确认为 2411 MHz 满载、16 独立链排除了依赖链限制）。可能官方计数含 FP32/INT32 复用管线或其他口径。**本项目的 roofline 一律以实测 64 FMA/clk/SM 为准。**
+> ⚠️ **CUDA core 口径分歧**：外部资料（含评价方）称 6144（=48×128），但本机实测 FP32 FFMA 吞吐只有 64 FMA/clk/SM（若为 128 条 lane/SM，2.4 GHz 下应测得 ≈29.5 TFLOPS，实测仅 15.23 且时钟确认为 2411 MHz 满载、16 独立链排除了依赖链限制）。可能官方计数含 FP32/INT32 复用管线或其他口径。**本项目的 roofline 一律以实测 64 FMA/clk/SM 为准。**
 
 | 参数 | 值 | 来源 |
 |---|---|---|
@@ -74,10 +74,10 @@ GPU（cc 12.1，消费级 Blackwell；第五代 Tensor Core；无 GPU 间 NVLink
 | 每 SM 驻留线程上限 | **1,536**（= 48 warps） | [驱动报告] |
 | 每 SM 驻留 block 上限 | 24 | [驱动报告] |
 | 每 block 线程上限 | 1,024 | [驱动报告] |
-| SM 时钟 | 空闲 208 MHz → 应用时钟 2418 MHz → 张量满载持续 **~2405 MHz**（最大加速 3003 MHz） | [nvidia-smi 轮询实测] |
+| SM 时钟 | 空闲 208 MHz → 应用时钟 2418 MHz → 张量满载持续 **≈2405 MHz**（最大加速 3003 MHz） | [nvidia-smi 轮询实测] |
 | 协作/集群 launch、并发 kernel、流优先级 | 均支持 | [驱动报告] |
 
-**为什么 L2 只有 24 MB 很重要**：4096³ 的 A+B 共 64 MB，装不进 L2——这直接迫使本项目发明 block swizzle（GROUP_M=8）来控制 L2 复用窗口（v7 实测 8192³ +43%）。数据中心卡 L2 有 50~126 MB，没有这个问题。
+**为什么 L2 只有 24 MB 很重要**：4096³ 的 A+B 共 64 MB，装不进 L2——这直接迫使本项目发明 block swizzle（GROUP_M=8）来控制 L2 复用窗口（v7 实测 8192³ +43%）。数据中心卡 L2 有 50–126 MB，没有这个问题。
 
 ---
 
@@ -128,7 +128,7 @@ ncu 计数器被权限锁定（`ERR_NVGPUCTRPERM`），子分区细节无法直�
 | BF16 `mma.sync.m16n8k16` | **1024**（=512 FMA） | **118.37 TFLOPS** | 8 独立累加器 ILP 压满 [实测] |
 | TF32 `mma.sync.m16n8k8` | **512** | **58.95 TFLOPS** | 同上 [实测] |
 | FP32 FFMA（CUDA core） | **128**（=64 FMA） | **15.23 TFLOPS** | PTX fma 16 独立链 @ 实抓 2411 MHz [实测] |
-| FP64 | ~4 | ~0.23 TFLOPS | 官方比值 64:1 [推导，未实测] |
+| FP64 | ≈4 | ≈0.23 TFLOPS | 官方比值 64:1 [推导，未实测] |
 | smem → 寄存器（ldsm） | — | 130 TB/s 聚合 | v5 消融探针 [实测] |
 
 **说明**：
@@ -188,13 +188,13 @@ DRAM        128 GB (LPDDR5X)     ~400 ns [实测]   253~256 GB/s [实测]
 |---|---|---|---|
 | 寄存器 | 256 KB/SM（64K×32b） | —（指令操作数） | — |
 | L1 / smem | 100 KB/SM | —（约几十周期量级，未单独标定） | ldsm 聚合 **130 TB/s** |
-| L2 | 24 MB | **~143 ns**（8MB buffer 追逐） | **8.0~12.0 TB/s**（≤L2 容量 buffer 反复读） |
-| DRAM | 128 GB 统一 | **~400 ns**（512MB buffer 追逐） | **253.5~255.6 GB/s** |
+| L2 | 24 MB | **≈143 ns**（8MB buffer 追逐） | **8.0–12.0 TB/s**（≤L2 容量 buffer 反复读） |
+| DRAM | 128 GB 统一 | **≈400 ns**（512MB buffer 追逐） | **253.5–255.6 GB/s** |
 
 **层级间比例（记住这三个数就够）**：
-- L2 带宽 ≈ DRAM 的 **40~47 倍** → tile 数据尽量从 L2 复用（swizzle 的意义）
-- L2 延迟 ≈ DRAM 的 1/2.8 → 都远慢于计算（一条 mma ≈ 1~2 ns），必须靠多级流水掩盖
-- smem 带宽 ≈ L2 的 11~16 倍 → 计算的操作数必须全部驻 smem/寄存器，绝不直接从 L2/DRAM 喂 mma
+- L2 带宽 ≈ DRAM 的 **40–47 倍** → tile 数据尽量从 L2 复用（swizzle 的意义）
+- L2 延迟 ≈ DRAM 的 1/2.8 → 都远慢于计算（一条 mma ≈ 1–2 ns），必须靠多级流水掩盖
+- smem 带宽 ≈ L2 的 11–16 倍 → 计算的操作数必须全部驻 smem/寄存器，绝不直接从 L2/DRAM 喂 mma
 
 **带宽与算力的匹配（roofline 转折点）**：
 
@@ -214,7 +214,7 @@ DRAM        128 GB (LPDDR5X)     ~400 ns [实测]   253~256 GB/s [实测]
 | `mma.sync.m16n8k16` BF16/FP16 | 张量核主力指令形态；TF32 是 m16n8k8 | v2 起全版本使用 |
 | **`mma.sync.m16n8k32` FP8（e4m3/e5m2）** | **实测 235.79 TFLOPS = BF16 的 2 倍**；精度换吞吐的空间 | 编译探针（sm_121 通过）+ 微基准实测 |
 | `ldmatrix`（x4 / x2.trans） | smem→寄存器，专为 mma 供操作数 | v2 dump 逐位验证布局 |
-| `cp.async`（16B） | Ampere 风格异步拷贝 | v3~v7 使用 |
+| `cp.async`（16B） | Ampere 风格异步拷贝 | v3–v7 使用 |
 | TMA `cp.async.bulk.tensor.2d` | 一条指令搬整个 tile，需 `-lcuda` + `__grid_constant__ CUtensorMap`；越界自动补 0 | v8 使用 |
 | `mbarrier` + `try_wait.parity` | full/empty 障栅（**但有 §7 怪癖**） | v8 使用 |
 | 协作 launch / 集群 launch | persistent kernel 的前提 | 驱动报告 |
@@ -232,7 +232,7 @@ DRAM        128 GB (LPDDR5X)     ~400 ns [实测]   253~256 GB/s [实测]
 
 TMA 是 **Hopper 引入的专用数据搬运引擎**（SM 旁的 DMA 单元）：一条指令把**整个 tile** 从 global 搬进 shared memory，硬件代劳一切。本项目 v8 起在用它。
 
-**与 cp.async 的本质区别**（v3~v7 用 cp.async，v8 换 TMA）：
+**与 cp.async 的本质区别**（v3–v7 用 cp.async，v8 换 TMA）：
 
 | | cp.async（Ampere 风格） | TMA（Hopper+ 风格） |
 |---|---|---|
@@ -253,7 +253,7 @@ TMA 是 **Hopper 引入的专用数据搬运引擎**（SM 旁的 DMA 单元）�
 
 ## 7. 硬件行为怪癖（本项目踩坑实测，写代码前必读）
 
-1. **`mbarrier.arrive` 的隐式 release 不排序先前的 LDSM 读**——arrive 作为 LSU 原子可越过未返回的 ldmatrix 数据发射。后果：consumer leader arrive 空 barrier 后，producer 发的 TMA 可能覆写尚未读完的 stage（间歇性数据竞争，4096³ 约 30~50% 概率出错）。**修复：arrive 前显式 `fence.acq_rel.cta`**（v8 实测定位，代价 -4%）。`__syncwarp()` 无效、256 线程各自 arrive 也无效。
+1. **`mbarrier.arrive` 的隐式 release 不排序先前的 LDSM 读**——arrive 作为 LSU 原子可越过未返回的 ldmatrix 数据发射。后果：consumer leader arrive 空 barrier 后，producer 发的 TMA 可能覆写尚未读完的 stage（间歇性数据竞争，4096³ 约 30–50% 概率出错）。**修复：arrive 前显式 `fence.acq_rel.cta`**（v8 实测定位，代价 -4%）。`__syncwarp()` 无效、256 线程各自 arrive 也无效。
 2. **`cp.async.mbarrier.arrive` 变体会死锁**——只有 TMA 的 `arrive.expect_tx` + `complete_tx::bytes` 模式可靠。
 3. **racecheck 对 mbarrier/TMA 竞争完全失明**（0 hazards 报告但实际有 race）——只能靠消融实验矩阵定位。
 4. **ncu 硬件计数器被权限锁定**（`ERR_NVGPUCTRPERM`）——一切微架构分析只能靠自建探针。
@@ -289,7 +289,7 @@ L2 延迟 143ns ────────→ TMA 预取 2 级 lookahead（3.2μs�
 
 ## 9. cuBLAS 引擎地图（本机 nsys 实测，2026-11-01）
 
-cuBLAS 不是一个写死的 kernel，而是**点菜系统**：库内预装一批 **CUTLASS 预编译 kernel**（构建期模板实例化，每个架构约 1600 个 cubin），外加 **nvjet JIT 编译器**（首次调用某形状时现场生成 kernel，产物缓存在 `~/.nv/ComputeCache`，本机实测 247MB）。dispatcher 按形状/精度/布局打分挑一个。
+cuBLAS 不是一个写死的 kernel，而是**点菜系统**：库内预装一批 **CUTLASS 预编译 kernel**（构建期模板实例化，每个架构约 1600 个 cubin），外加 **nvjet JIT 编译器**（首次调用某形状时现场生成 kernel，产物缓存在 `$HOME/.nv/ComputeCache`，本机实测 247MB）。dispatcher 按形状/精度/布局打分挑一个。
 
 ### 本机实测：形状 → 引擎/配置路由
 
@@ -316,13 +316,13 @@ nvjet_sm121_tst_mma_128x208x64_2_32x104x64_tmaAB_bz_NNNN
 ### 路由逻辑（含推断成分）
 
 - **512³ → nvjet 小 tile**：用 128×256 只有 8 个 block（48 SM 里 40 个空闲）；nvjet 现场合成 64×104 → 8×5=40 block（填充率 83%），tile 小就配 4-stage+BK=64 补偿。**104 这种非 2 幂 tile 只有 JIT 做得到**——预制菜单不可能枚举。
-- **1024~4096³ → CUTLASS 预制菜**：形状常规，预制 kernel 成熟且免 JIT 编译开销（首调要现编译几十 ms）；dispatcher 还会翻 tile 方向（1024/2048 选 256×128、4096 选 128×256，按 L2 复用模式选）。
+- **1024–4096³ → CUTLASS 预制菜**：形状常规，预制 kernel 成熟且免 JIT 编译开销（首调要现编译几十 ms）；dispatcher 还会翻 tile 方向（1024/2048 选 256×128、4096 选 128×256，按 L2 复用模式选）。
 - **8192³ → nvjet 大 BK**：波次深（53 波）尾波 <1%，比拼吞吐：BK=64 同步减半 + TMA A+B，2-stage 即可（lookahead 2×86KB）。
 
 ### 对本项目的直接结论
 
 1. **没人用 persistent kernel**——三种 kernel 的 grid 全 = tile 数，尾波照吃。persistent 的预期收益降级为"消尾波+epilogue 重叠"而非"cuBLAS 靠这个"。
-2. **寄存器 218~255（我们 v7/v8 是 198）**——多出的空间正是 warp 级片段双缓冲（CUTLASS `mma_multistage.h` 的 `warp_loaded_frag_[2]` 结构，v9 依据）。
+2. **寄存器 218–255（我们 v7/v8 是 198）**——多出的空间正是 warp 级片段双缓冲（CUTLASS `mma_multistage.h` 的 `warp_loaded_frag_[2]` 结构，v9 依据）。
 3. **512³ 的解法是配置族切换**（小 tile + 深 stage + TMA），不是流水技巧——多 tile autotune 的立项依据。
 4. **BK=64 + TMA + 少 stage** 是大尺寸的另一条路线（减少同步次数而非加深流水），与加深流水互为备选。
 
