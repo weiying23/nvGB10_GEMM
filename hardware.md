@@ -228,6 +228,27 @@ DRAM        128 GB (LPDDR5X)     ~400 ns [实测]   253~256 GB/s [实测]
 
 → **本芯片的 GEMM 指令面 = Ampere 风格 mma.sync 流水**（张量核硬件是第五代，但只暴露 mma.sync 指令模型）。cuBLAS 同样受限：4096³ 用的就是 `cutlass_80_tensorop_bf16_s16816gemm_128x256_32x3`（sm80 kernel，nsys 抓包 [实测]），跑出 87.1 TFLOPS = BF16 峰值的 74%。**若走 FP8 路线，峰值可达 235.79 TFLOPS（本项目尚未做 FP8 GEMM）。**
 
+### 6.1 TMA（Tensor Memory Accelerator）是什么
+
+TMA 是 **Hopper 引入的专用数据搬运引擎**（SM 旁的 DMA 单元）：一条指令把**整个 tile** 从 global 搬进 shared memory，硬件代劳一切。本项目 v8 起在用它。
+
+**与 cp.async 的本质区别**（v3~v7 用 cp.async，v8 换 TMA）：
+
+| | cp.async（Ampere 风格） | TMA（Hopper+ 风格） |
+|---|---|---|
+| 谁发指令 | **每个线程各发各的**（16B/条，一个 tile 要几百条） | **一个线程发一条**（thread 0 独占，整 tile 交给硬件） |
+| 描述数据的方式 | 裸地址 | **CUtensorMap 描述符**（128B 结构体：形状/步长/box 尺寸，host 侧 `cuTensorMapEncodeTiled` 创建，`__grid_constant__` 传参） |
+| 寻址 | 线程算地址 | 发坐标 `{x, y}`（如 `{k_start, block_m}`），引擎自己展开 |
+| 越界处理 | 手动 mask/补齐 | **硬件自动填 0**（OOB zero-fill） |
+| 完成通知 | `cp.async.wait_group` 计数 | **mbarrier 事务字节**（`arrive.expect_tx` 声明字节数，搬运完成自动 `complete_tx`，phase 翻转） |
+| 对计算单元的占用 | 占用全体线程的 LSU 发射槽（与 ldsm 抢） | 几乎为零（LSU 完全让给 ldsm） |
+
+本芯片（SM121）验证过的用法与限制：
+- 指令：`cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes`，编译需 `-lcuda`；
+- 只有 CTA 范围（无 Hopper 的 cluster 多播/`cp.async.bulk.tensor` 的分布式共享版本）；
+- 一次搬运的 box 尺寸受 tensor map 约束（boxDim ≤ 256 元素/维，本项目用 {32,128} 和 {256,32}）；
+- **坑**：consumer 释放 smem buffer 给 TMA 覆写时，`mbarrier.arrive` 之前必须显式 `fence.acq_rel.cta`（见 §7.1——TMA 写入与 LDSM 读的竞争窗口）。
+
 ---
 
 ## 7. 硬件行为怪癖（本项目踩坑实测，写代码前必读）
@@ -265,6 +286,49 @@ L2 延迟 143ns ────────→ TMA 预取 2 级 lookahead（3.2μs�
 
 ---
 
+## 9. cuBLAS 引擎地图（本机 nsys 实测，2026-11-01）
+
+cuBLAS 不是一个写死的 kernel，而是**点菜系统**：库内预装一批 **CUTLASS 预编译 kernel**（构建期模板实例化，每个架构约 1600 个 cubin），外加 **nvjet JIT 编译器**（首次调用某形状时现场生成 kernel，产物缓存在 `~/.nv/ComputeCache`，本机实测 247MB）。dispatcher 按形状/精度/布局打分挑一个。
+
+### 本机实测：形状 → 引擎/配置路由
+
+| 尺寸 | kernel | tile | BK | stage | 加载 | grid | block | 寄存器 | dyn smem |
+|---|---|---|---|---|---|---|---|---|---|
+| 512³ | **nvjet** | 64×104 | **64** | **4** | TMA A+B | 64 | **128 线程** | 255 | 85KB |
+| 1024³ | cutlass_80 | **256×128**（转置方向） | 32 | 3 | cp.async | 32 | 256 | 218 | 72KB |
+| 2048³ | cutlass_80 | 256×128 | 32 | 3 | cp.async | 128 | 256 | 218 | 72KB |
+| 4096³ | cutlass_80 | 128×256×32×3 | 32 | 3 | cp.async | 512 | 256 | **228** | 72KB |
+| 8192³ | **nvjet** | 128×208 | **64** | **2** | TMA A+B | 320×8 | 256 | 255 | 85KB |
+
+（grid/block/寄存器/smem 来自 nsys sqlite 的 CUPTI launch 记录 [实测]；nvjet stage 数由 smem 反推验证：4×(64+104)×64×2B ≈ 2×(128+208)×64×2B ≈ 87,040B ✓）
+
+### 名字解码（两套命名都可读）
+
+```
+cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x256_32x3_nn_align8
+└arch族   └张量核    └精度 └指令m16n8k16 └epilogue └tile └BK└stage └布局 └对齐
+
+nvjet_sm121_tst_mma_128x208x64_2_32x104x64_tmaAB_bz_NNNN
+└JIT引擎 └目标arch     └tile M×N×BK └stage └warp tile └TMA A+B └布局（bz 等个别字段含义未公开）
+```
+
+### 路由逻辑（含推断成分）
+
+- **512³ → nvjet 小 tile**：用 128×256 只有 8 个 block（48 SM 里 40 个空闲）；nvjet 现场合成 64×104 → 8×5=40 block（填充率 83%），tile 小就配 4-stage+BK=64 补偿。**104 这种非 2 幂 tile 只有 JIT 做得到**——预制菜单不可能枚举。
+- **1024~4096³ → CUTLASS 预制菜**：形状常规，预制 kernel 成熟且免 JIT 编译开销（首调要现编译几十 ms）；dispatcher 还会翻 tile 方向（1024/2048 选 256×128、4096 选 128×256，按 L2 复用模式选）。
+- **8192³ → nvjet 大 BK**：波次深（53 波）尾波 <1%，比拼吞吐：BK=64 同步减半 + TMA A+B，2-stage 即可（lookahead 2×86KB）。
+
+### 对本项目的直接结论
+
+1. **没人用 persistent kernel**——三种 kernel 的 grid 全 = tile 数，尾波照吃。persistent 的预期收益降级为"消尾波+epilogue 重叠"而非"cuBLAS 靠这个"。
+2. **寄存器 218~255（我们 v7/v8 是 198）**——多出的空间正是 warp 级片段双缓冲（CUTLASS `mma_multistage.h` 的 `warp_loaded_frag_[2]` 结构，v9 依据）。
+3. **512³ 的解法是配置族切换**（小 tile + 深 stage + TMA），不是流水技巧——多 tile autotune 的立项依据。
+4. **BK=64 + TMA + 少 stage** 是大尺寸的另一条路线（减少同步次数而非加深流水），与加深流水互为备选。
+
+> 说明：nvjet 内部实现闭源无法读源码（JIT 缓存压缩、驱动导出表绕过 LD_PRELOAD 钩子，均实测尝试失败）；CUTLASS 路线有开源源码（本地 4.2.1），故 v7/v9 照 CUTLASS 抄。
+
+---
+
 ## 附：测量方法备忘（可复现）
 
 | 数据 | 方法 | 文件 |
@@ -277,4 +341,5 @@ L2 延迟 143ns ────────→ TMA 预取 2 级 lookahead（3.2μs�
 | L2 带宽 | ≤L2 容量 buffer × 48×32 blocks 反复读 | /tmp/opencode/l2bw.cu |
 | DRAM 带宽 | 1GB grid-stride float4 读 | `bench/bench_micro.cu` |
 | smem 带宽 | v5 消融探针纯 ldsm（微基准聚合吞吐，非硬件规格值） | `bench/probe_*.cu`（v5 时代） |
+| cuBLAS 引擎地图 | nsys 逐尺寸抓 kernel 名 + sqlite launch 记录（grid/block/regs/smem） | `/tmp/opencode/cublas_once.cu` + prof_*.nsys-rep |
 | 时钟 | 满载 kernel 运行中 nvidia-smi 轮询（每 0.4s） | — |
