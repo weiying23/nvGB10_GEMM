@@ -275,8 +275,8 @@ int main(int argc, char** argv) {
     int K = argc > 3 ? atoi(argv[3]) : 4096;
     bool do_check = (argc <= 4);
 
-    if (M % 16 != 0 || N % 16 != 0 || K % 16 != 0) {
-        fprintf(stderr, "Error: M/N/K must be multiples of 16 (TMA alignment)\n");
+    if (M % 8 != 0 || N % 8 != 0 || K % 8 != 0) {
+        fprintf(stderr, "Error: M/N/K must be multiples of 8 (TMA stride alignment)\n");
         return 1;
     }
 
