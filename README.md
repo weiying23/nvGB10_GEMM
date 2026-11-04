@@ -62,7 +62,7 @@ Step 4 验证（性能双百分比：峰值利用率 + 相对 cuBLAS；精度 vs
 
 两个铁律：**所有性能数字以压测为准，禁止推测**；**精度参照 = 同精度 cuBLAS**（不是 FP32 真值）。
 
-## V1–V10 优化轨迹
+## V1–V11 优化轨迹
 
 ### 成绩总览（4096³，同机实测）
 
@@ -78,7 +78,8 @@ Step 4 验证（性能双百分比：峰值利用率 + 相对 cuBLAS；精度 vs
 | **v7** | **照抄 cuBLAS 配置 + block swizzle** | **54.31** | **45.9%** | **62.4%** | ✅ |
 | **v8** | TMA + mbarrier full/empty（零 `__syncthreads`） | 59.2 | 50.0% | 68.0% | ✅ |
 | v9 | padded smem 布局消 LDSM bank conflict（A 4路/B 8路→0） | 67.9 | 57.4% | 78.0% | ✅ |
-| **v10** | **TMA + SWIZZLE_128B + BK=64（nvjet 路线）** | **84.1** | **71.1%** | **96.6%** | ✅ |
+| v10 | TMA + SWIZZLE_128B + BK=64（nvjet 路线） | 84.1 | 71.1% | 96.6% | ✅ |
+| **v11** | **epilogue：smem 暂存 + TMA store** | **88.9** | **75.1%** | **102%** | ✅ |
 
 ### 每一轮的瓶颈定位 → 结论
 
@@ -152,8 +153,8 @@ v7 配置：BM=128, BN=256, BK=32，8 warps（256 线程，2×4 排布），每 
 
 ```
 criterion.md        优化守则（四步循环 + 双百分比判定 + 精度标准）
-gemm_v0.cu ~ v10.cu  11 个版本的 GEMM 实现（每个可独立编译运行）
-reports/v0.md~v10.md 每版结论文档（瓶颈→方案→实测→教训）
+gemm_v0.cu ~ v11.cu  12 个版本的 GEMM 实现（每个可独立编译运行）
+reports/v0.md~v11.md 每版结论文档（瓶颈→方案→实测→教训）
 bench/bench_micro.cu    峰值算力/带宽压测（标定 100% 标尺）
 bench/cublas_bench.cu   cuBLAS baseline（性能参照）
 bench/probe_v7cfg.cu    v7 配置消融探针（mma/ldsm/sync 逐项排除）
