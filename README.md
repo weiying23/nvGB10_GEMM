@@ -62,7 +62,7 @@ Step 4 验证（性能双百分比：峰值利用率 + 相对 cuBLAS；精度 vs
 
 两个铁律：**所有性能数字以压测为准，禁止推测**；**精度参照 = 同精度 cuBLAS**（不是 FP32 真值）。
 
-## V1–V9 优化轨迹
+## V1–V10 优化轨迹
 
 ### 成绩总览（4096³，同机实测）
 
@@ -77,7 +77,8 @@ Step 4 验证（性能双百分比：峰值利用率 + 相对 cuBLAS；精度 vs
 | v6 | B 换 x4 ldmatrix / WN=32 | — | — | — | ❌ 假设证伪 |
 | **v7** | **照抄 cuBLAS 配置 + block swizzle** | **54.31** | **45.9%** | **62.4%** | ✅ |
 | **v8** | TMA + mbarrier full/empty（零 `__syncthreads`） | 59.2 | 50.0% | 68.0% | ✅ |
-| **v9** | **padded smem 布局消 LDSM bank conflict（A 4路/B 8路→0）** | **67.9** | **57.4%** | **78.0%** | ✅ |
+| v9 | padded smem 布局消 LDSM bank conflict（A 4路/B 8路→0） | 67.9 | 57.4% | 78.0% | ✅ |
+| **v10** | **TMA + SWIZZLE_128B + BK=64（nvjet 路线）** | **84.1** | **71.1%** | **96.6%** | ✅ |
 
 ### 每一轮的瓶颈定位 → 结论
 
@@ -132,6 +133,14 @@ v7 配置：BM=128, BN=256, BK=32，8 warps（256 线程，2×4 排布），每 
 - 方法论收获：**探针的寻址模式必须与真实 kernel 逐位一致**（v5 的"ldsm 带宽排除"用的是无冲突模式，掩盖了冲突）；
 - 下一步：v8 的 mbarrier 零同步叠加（+8.5% 预期）→ TMA SWIZZLE_128B + BK=64（nvjet 正统路线）。
 
+**v9 → v10：TMA + SWIZZLE_128B + BK=64（+24%）——大形状追平 cuBLAS**
+
+- 合流点：padded（零冲突）与 mbarrier 零同步原本互斥（TMA 写不了 padded 布局），TMA 的 `SWIZZLE_128B` 模式一次解决——硬件写入时自动 XOR 交错，同时拿到「零 bank conflict + TMA + 零 `__syncthreads`」；
+- 落位公式 `物理偏移 = r*128 + ((c/8) ^ (r%8))*16 + (c%8)*2` 先用探针逐位验证（12288 元素 0 差异），主 kernel 一次通过零调试；
+- BK=64 + 2-stage（nvjet 同款）、B 拆 4 个 {64,64} box（warp_n 天然对应 chunk）、mma 分 2 pair 处理保片段寄存器不膨胀（190 regs）；
+- 4096³ 67.9→**84.1（cuBLAS 96.6%）**、8192³ 75.3→**91.7（95.4%）**、全尺寸 +19~24%；
+- 剩余缺口转移：1024³ 的 30%（SM 填充病，autotune/split-K 地盘）> 2048³ 的 20% > 大形状的 3~5%。
+
 ### 核心方法论收获
 
 1. **消融探针是定位指令级瓶颈的唯一手段**（本机 ncu counter 权限被锁）：逐项排除法最终定位到「ldsm 延迟依赖」，这是 Roofline 完全看不到的一层；
@@ -143,8 +152,8 @@ v7 配置：BM=128, BN=256, BK=32，8 warps（256 线程，2×4 排布），每 
 
 ```
 criterion.md        优化守则（四步循环 + 双百分比判定 + 精度标准）
-gemm_v0.cu ~ v9.cu  10 个版本的 GEMM 实现（每个可独立编译运行）
-reports/v0.md~v9.md 每版结论文档（瓶颈→方案→实测→教训）
+gemm_v0.cu ~ v10.cu  11 个版本的 GEMM 实现（每个可独立编译运行）
+reports/v0.md~v10.md 每版结论文档（瓶颈→方案→实测→教训）
 bench/bench_micro.cu    峰值算力/带宽压测（标定 100% 标尺）
 bench/cublas_bench.cu   cuBLAS baseline（性能参照）
 bench/probe_v7cfg.cu    v7 配置消融探针（mma/ldsm/sync 逐项排除）

@@ -245,6 +245,7 @@ TMA 是 **Hopper 引入的专用数据搬运引擎**（SM 旁的 DMA 单元）�
 
 本芯片（SM121）验证过的用法与限制：
 - 指令：`cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes`，编译需 `-lcuda`；
+- **SWIZZLE_128B 模式已验证可用**（v10）：TMA 写入时硬件自动做 XOR 槽位交错（`物理偏移 = r*128 + ((c/8) ^ (r%8))*16 + (c%8)*2`，探针逐位验证），使 LDSM 零 bank conflict——box 内维须 ≤128B；
 - 只有 CTA 范围（无 Hopper 的 cluster 多播/`cp.async.bulk.tensor` 的分布式共享版本）；
 - 一次搬运的 box 尺寸受 tensor map 约束（boxDim ≤ 256 元素/维，本项目用 {32,128} 和 {256,32}）；
 - **坑**：consumer 释放 smem buffer 给 TMA 覆写时，`mbarrier.arrive` 之前必须显式 `fence.acq_rel.cta`（见 §7.1——TMA 写入与 LDSM 读的竞争窗口）。
