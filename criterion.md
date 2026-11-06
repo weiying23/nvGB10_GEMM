@@ -203,7 +203,7 @@ ncu --query-metrics | grep -iE "tensor|dram|bank_conflict|stall|local_mem|warps_
 5. **寄存器溢出** `l1tex__t_sectors_pipe_lsu_mem_local_op_ld/st`
    → 非零则说明有 local memory spill，必须优先修。
 
-> **本机注意**：消费级 GPU 的 ncu counter 权限可能被锁。若 `ncu --set speed-of-light` 报 `ERR_NVGPUCTRPERM`，需要 root 运行或设置 `NVreg_RestrictProfilingToAdminUsers=0`。若确实无法采到 counter，改用 2.4 的消融法替代。
+> **本机注意**：消费级 GPU 的 ncu counter 权限可能被锁。若 `ncu --set speed-of-light` 报 `ERR_NVGPUCTRPERM`，需要 root 运行或设置 `NVreg_RestrictProfilingToAdminUsers=0`。若确实无法采到 counter，改用 2.4 的自建探针替代（本机即为该情况）。
 
 ### 2.3 编译期静态检查（零成本，每次编译都做）
 
@@ -217,9 +217,30 @@ nvcc -arch=sm_120 -Xptxas -v -c your_kernel.cu -o /dev/null
 - **`spilled registers`**：一旦出现即为性能断崖，本轮最高优先级修复。
 - **local memory 使用**：同上。
 
-### 2.4 兜底：消融法（无 profiler 时 / 想量化每个优化贡献时）
+### 2.4 自建探针：控制变量法的四种形态（与 2.1 Roofline 配套的指令级定位主力）
 
-按第 7 节附录 B 的消融表，从朴素 kernel 逐项叠加优化，记录每一步两个百分比的增量。**每个增量的来源，就是该优化消掉的那一类瓶颈。**
+**定义**：为了回答一个具体问题而写的最小对照实验程序——让"有某因素"和"没有某因素"两个版本**除这一个变量外逐位相同**，跑一遍看差值，差值即该因素的精确代价。几十到三百行的一次性 `.cu`，放 `bench/probe_*.cu`，与报告一起归档（可复现）。
+
+**为什么**：ncu counter 可能被权限锁定（本机即如此），但**时间永远可测**——把"慢在哪"翻译成"哪个因素的加减改变总时间"。Roofline（2.1）负责把你放在斜线还是屋顶下（粗定位），探针负责回答"屋顶下还差哪一块"（精定位）；且探针的一切分母（峰值/带宽）来自 2.1 的实测标定，两者是一章之内的配套关系。
+
+**四种形态**（每类都给本项目的真实产出，全部实测）：
+
+| 形态 | 方法 | 本项目案例与产出 |
+|---|---|---|
+| ① 消融探针 | 从 kernel 结构逐项去掉/加回一个组件，测阶梯差值 | `probe_v7cfg.cu`：纯 mma 116.2 → +ldsm 106.2 → +1×`__syncthreads` 71.0 → **定位 sync 为 v7 主瓶颈（-33%），v8 的立项依据** |
+| ② 判别探针 | 两个版本只差一个嫌疑变量，A/B 对照 | `probe_ldsm.cu`：同一条 `ldmatrix` 只改行距 64B/80B/512B → 4.0×/1×/8.0×，**bank conflict 4 路/8 路实锤（v9）**；非 2 幂步长判别：M/N/K 混合对照 → 锁定只看 K |
+| ③ 微基准 | 标定一项硬件能力，给 roofline/公式提供分母或验证 | `bench_micro.cu`（峰值 118.37/带宽 255.6）、指针追逐（L2 143ns/DRAM 400ns）、`probe_tmaswiz.cu`（TMA swizzle 公式 12288 元素逐位比对，公式验证后才写主 kernel） |
+| ④ 错误定位探针 | 构造判别矩阵锁定规律，再推根因 | v11 奇数 K 块 race：非方形 FAIL → 1984/4032 奇偶对照 → "奇数 K 块必触发"规律 → 根因（warp 错位 + stage 复用）自明 |
+
+**三条纪律**（全部是本项目踩坑换来的，违反任何一条探针就会说谎）：
+
+1. **一次只动一个变量**——否则差值无法归因；
+2. **探针的指令构成/寻址模式必须与真实 kernel 逐位一致**——v5 时代"ldsm 带宽 130 TB/s、排除"的探针恰好用了无冲突寻址，把 bank conflict 掩盖了三周（v9 才发现）；若探针是简化版，结论必须注明边界；
+3. **探针结论 ≠ kernel 结论**——v6 的 ILP 探针说"4 个独立 mma 摊薄延迟"（115 TFLOPS），kernel 实测 -20%：真实 kernel 有耦合副作用（B 访存翻倍 + occupancy 下降）。**探针定方向，完整实测定采纳**；被证伪的探针外推要记录（v6/v9 双缓冲两次证伪均为负结果归档）。
+
+**与 profiler 的分工**：counter 回答"慢在哪条管线"（间接证据），探针回答"改哪里能快多少"（直接证据）。有 profiler 时两者并用；没有时探针独立完成任务——但注意 racecheck/memcheck 类工具对 mbarrier/TMA 等异步机制可能失明（实测盲区，见 `hardware.md` 怪癖），涉及正确性问题时判别探针是唯一可靠手段。
+
+消融表的完整格式见第 7 节附录 B。
 
 ### 2.5 Step 1 产出
 
