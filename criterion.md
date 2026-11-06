@@ -51,8 +51,8 @@
 |---|---|---|
 | BF16 | **118.37** | 与 FP16 同量级 |
 | TF32 | **59.19** | 恰好为 BF16 一半 |
-| FP8 | **不支持** | sm_121 不支持 `kind::f8f6f4` mma.sync，也无 tcgen05 |
-| FP4 | **不支持** | 同上 |
+| FP8 | **235.79** | `mma.sync.m16n8k32.f32.e4m3/e5m2` 实测可用，恰为 BF16 的 2 倍 |
+| FP4 | **未验证** | 所试 PTX 语法在 sm_120 上同样编译失败，语法未确定，不能下结论 |
 
 | 项目 | 实测值 | 备注 |
 |---|---|---|
@@ -69,12 +69,12 @@
 
 > **守则**：峰值算力与内存带宽一律以上表实测为准；重新压测后需更新本表。不压测的利用率不可信。
 >
-> **本机约束（重要）**：GB10（sm_121）手写 PTX 层面，张量核仅支持 BF16/FP16/TF32 的 `mma.sync`（m16n8k16 / m16n8k8）。`kind::f8f6f4`、`mxf8f6f4`、`mxf4`、`tcgen05.mma` 均被 ptxas 报 "not supported on sm_121"——官方宣传的 FP4 1 PFLOP 是稀疏值且依赖 cuDNN/cuBLAS 软件栈，**手写 GEMM 无法使用 FP8/FP4 原生张量核**。故本机 GEMM 优化只针对 BF16（可选 FP16/TF32）。
+> **本机约束（重要）**：GB10（sm_121）手写 PTX 层面，张量核支持 BF16/FP16/TF32（`mma.sync` m16n8k16 / m16n8k8）与 **FP8（`mma.sync.m16n8k32.f32.e4m3/e5m2`，实测 235.79 TFLOPS = BF16 的 2 倍）**；FP4 未验证（语法未确定）。`tcgen05.mma` 等 sm_90/100 专属指令不可用，无法复现「操作数直接从 smem 喂张量核」的路径。当前优化主线针对 BF16，FP8 为后续可选路线（峰值 2×）。
 
 ### 0.4 cuBLAS 基线（固定参照，按形状缓存，只测一次）
 
-- 每个**首次评测到的形状**，用 cuBLAS / cuBLASLt 实测一次有效算力，作为该形状的固定 baseline。
-- **只测一次并缓存**：结果写入 `baselines/cublas.json`，后续迭代直接查表引用，**不重测**。
+- 每个**首次评测到的形状**，用 cuBLAS / cuBLASLt 实测有效算力，结果写入 `baselines/cublas.json` 缓存，后续日常迭代直接查表引用。
+- **关键对照实验必须同会话交替重测**：cuBLAS 在部分形状上 run-to-run 方差较大（可超过 ±5%），缓存值只作日常参照；两版对比时须与本实现在**同一会话内交替测量**（共享热状态），不得用不同日期的数字下采纳/否决结论。
 - 缓存记录：形状、dtype、有效算力、日期、commit、计时方法。
 
 已实测的 cuBLAS baseline（2026-10-21，压测代码见 `bench/cublas_bench.cu`）：
@@ -208,7 +208,7 @@ ncu --query-metrics | grep -iE "tensor|dram|bank_conflict|stall|local_mem|warps_
 ### 2.3 编译期静态检查（零成本，每次编译都做）
 
 ```bash
-nvcc -arch=sm_120 -Xptxas -v -c your_kernel.cu -o /dev/null
+nvcc -arch=sm_121 -Xptxas -v -c your_kernel.cu -o /dev/null
 ```
 
 记录三项：
@@ -266,7 +266,7 @@ nvcc -arch=sm_120 -Xptxas -v -c your_kernel.cu -o /dev/null
 | Step 1 结论 | 候选优化措施 |
 |---|---|
 | memory-bound / `long_scoreboard` | 增加 pipeline stage、TMA multicast、swizzle 消 bank conflict、block swizzle（L2 复用）、调整 tile 提高算术强度 |
-| compute-bound / 张量核利用率低 | 增加 mma 指令密度、减少同步（`barrier` stall）、提升 occupancy、消除 spill、stage 合并（减少 `wait`） |
+| compute-bound / 张量核利用率低 | 增加 mma 指令密度、减少同步（`barrier` stall）、消除 spill、stage 合并（减少 `wait`）；occupancy 两个方向都要实测对比：高 occupancy（多 warp 互填）与**低 occupancy 换高 ILP**（大 warp tile + 多累加器摊薄依赖延迟） |
 | `barrier` stall | 调整 stage 数、均衡 TMA 与计算节奏、异步 barrier（`arrive_and_expect_tx`） |
 | 寄存器溢出 | 减小 tile、调整累加器布局、拆分 epilogue |
 | bank conflict | 改 swizzle mode（32/64/128B）、调整 swizzle atom |
@@ -424,18 +424,21 @@ git commit -m "iterN: +stage 4->6, peak 72%->81%, cublas 98%->112%, err 1.2e-3"
 3. **cuBLAS baseline**：对每个首次评测的形状，用 cuBLAS/cuBLASLt 实测一次有效算力并缓存到 `baselines/cublas.json`，后续不再重测。
 4. 校准要在**同一次运行、同时钟状态下**进行，与主 kernel 使用相同计时方法；时钟波动时用足够长的 kernel 平均。
 
-### 附录 B — 消融基线表（Step 2 兜底与归因）
+### 附录 B — 消融基线表（实测轨迹，4096³）
 
-| 步骤 | 累计优化 | 利用率参考（相对实测峰值，非绝对 TFLOPS） |
+> 表内为各优化叠加后的**实测**峰值利用率（分母 = 实测峰值 118.37），非预估。未实施的优化（warp 特化、split-K 等）不列，待实测后补充。
+
+| 步骤 | 累计优化 | 峰值利用率（实测） |
 |---|---|---|
-| 0 | global 直接算（基线） | 极低 |
-| 1 | + 分块 tile + 寄存器累加 | 20–40% |
-| 2 | + smem 双缓冲 | 40–60% |
-| 3 | + TMA 异步加载 | 60–75% |
-| 4 | + 多 stage pipeline | 75–85% |
-| 5 | + warp 特化 | 85–90% |
-| 6 | + swizzle 消 bank conflict | +几个点 |
-| 7 | + block swizzle（L2） | +几个点 |
+| 0 | global 直接算（基线） | 1.1% |
+| 1 | + 分块 tile + 寄存器累加 | 2.7% |
+| 2 | + `mma.sync` + `ldmatrix`（上张量核） | 9.3% |
+| 3 | + `cp.async` 双缓冲流水 | 18.0% |
+| 4 | + CUTLASS 配置（64×64 warp tile、128 累加器、低 occupancy 高 ILP）+ block swizzle | 45.9% |
+| 5 | + TMA + mbarrier（零 `__syncthreads`） | 50.0% |
+| 6 | + 消 LDSM bank conflict（padding 布局） | 57.4% |
+| 7 | + TMA `SWIZZLE_128B` + BK=64（零冲突与零同步合流） | 71.1% |
+| 8 | + TMA store epilogue | 75.1% |
 
 ### 附录 C — 术语速查
 
@@ -453,5 +456,5 @@ git commit -m "iterN: +stage 4->6, peak 72%->81%, cublas 98%->112%, err 1.2e-3"
 - 编译目标 `-arch=sm_121`（本机 cc 12.1）。
 - 每 SM shared memory 上限 **100 KB**，多 stage 时务必算清 `stage × (A_tile + B_tile) ≤ 100KB`。
 - 张量核只能用 **`mma.sync`**：BF16 用 `m16n8k16`，TF32 用 `m16n8k8`；操作数必须经 `ldmatrix`/`ld.shared` 从 smem 搬入寄存器。
-- **本机（sm_121）不支持 `tcgen05`/`TMEM`/`STSM`（数据中心 Blackwell 专属），也不支持 FP8 的 `kind::f8f6f4` mma.sync**——因此 FP8/FP4 张量核在本机不可用，且不能复现 DeepGEMM 的 WGMMA/UMMA"操作数直接从 smem 喂张量核"优化。
+- **本机（sm_121）不支持 `tcgen05`/`TMEM`/`STSM`（数据中心 Blackwell 专属）**，不能复现 DeepGEMM 的 WGMMA/UMMA"操作数直接从 smem 喂张量核"优化；**FP8 的 `mma.sync.m16n8k32`（e4m3/e5m2）可用**（实测 235.79 TFLOPS），FP4 未验证。
 - 无 Hopper 的 `warpgroup_reg_alloc/dealloc`，寄存器按经典 occupancy 计算。
