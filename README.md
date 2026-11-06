@@ -1,8 +1,9 @@
-# nvGB10_GEMM — NVIDIA GB10 上的 BF16 GEMM 优化（v0 → v7）
+# nvGB10_GEMM — NVIDIA GB10 上的 BF16 GEMM 优化（v0 → v11）
 
-在 NVIDIA GB10（DGX Spark，SM120/121 消费级 Blackwell）上，用纯 CUDA C++ 从零实现 BF16 GEMM，
-经过 7 轮「消融探针定位 → 假设 → 实测证伪/采纳」迭代，从标量 1.26 TFLOPS 优化到 **54.3 TFLOPS（cuBLAS 的 62%）**，
-全程与 cuBLAS 对拍精度（`max_rel_err = 0`，逐位一致）。
+在 NVIDIA GB10（DGX Spark，SM121 消费级 Blackwell）上，用纯 CUDA C++ 从零实现 BF16 GEMM，
+经过 11 轮「roofline/消融探针定位 → 假设 → 实测证伪/采纳」迭代，从标量 1.26 TFLOPS 优化到 **88.9 TFLOPS（cuBLAS 87.10 的 102%）**，
+全程与 cuBLAS 对拍精度（`max_rel_err = 0`，逐位一致）。每轮的完整记录见 `reports/`（v0–v11），
+硬件全景见 `hardware.md`。
 
 ## 测试运行环境
 
@@ -19,29 +20,30 @@
 | cuBLAS | 13.1（作为精度参照与性能 baseline） |
 
 **本机硬件边界（重要）**：
-- SM121 只有 `mma.sync`（m16n8k16 BF16），**没有** `tcgen05`/`TMEM`（数据中心 Blackwell）、**没有** `WGMMA`（Hopper）、**没有** FP8/FP4 指令；
-- 因此 DeepGEMM 的「smem 直读张量核」路径在本机不可用，必须走 `smem → ldmatrix → 寄存器 → mma.sync`。
+- SM121 的张量核指令面 = `mma.sync` 家族（BF16/FP16/TF32；**FP8 e4m3/e5m2 实测支持且峰值 235.79 TFLOPS = BF16 的 2 倍**；FP4 未验证），**没有** `tcgen05`/`TMEM`（数据中心 Blackwell）、**没有** `WGMMA`（Hopper）；
+- 因此 DeepGEMM 的「smem 直读张量核」路径在本机不可用，必须走 `smem → ldmatrix → 寄存器 → mma.sync`；
+- 完整硬件参数、实测怪癖（LDSM bank conflict 规律、2 的幂全局步长惩罚等）见 `hardware.md`。
 
 ## 如何编译与测试
 
 ```bash
-# 所有版本同一编译方式（-lcublas 用于精度对拍）
-nvcc -O3 -arch=sm_121 -lcublas -o gemm_v0 gemm_v0.cu
-nvcc -O3 -arch=sm_121 -lcublas -o gemm_v1 gemm_v1.cu
-# ... gemm_v2 ~ gemm_v7 同理
+# v0 ~ v7（-lcublas 用于精度对拍）
+nvcc -O3 -arch=sm_121 -lcublas -o gemm_v1 gemm_v1.cu        # v0~v7 同理
 
-# 运行（默认 4096³，第 4 个参数任意值 = 跳过 CPU 正确性验证，只测性能）
-./gemm_v7                          # 4096³，性能 + vs cuBLAS 精度对拍
-./gemm_v7 2048 2048 2048           # 自定义尺寸
-./gemm_v7 4096 4096 4096 skip      # 只测性能（大尺寸时跳过慢的 CPU 验证）
+# v8 及以后：TMA 需要 -lcuda（tensor map 走驱动 API）
+nvcc -O3 -arch=sm_121 -lcuda -lcublas -o gemm_v11 gemm_v11.cu
 
-# 基准压测（测本机峰值算力与带宽）
+# 运行（默认 4096³，第 4 个参数任意值 = 跳过对拍，只测性能）
+./gemm_v11                         # 4096³，性能 + vs cuBLAS 精度对拍
+./gemm_v11 4096 4096 4096 skip     # 只测性能
+./gemm_v11 2048 2016 4032          # 非方形/非 2 幂（M/N/K 需为 8 的倍数）
+
+# 基准压测与探针（bench/ 下 20+ 份，每份可独立编译复现对应报告的测量）
 cd bench
-nvcc -O3 -arch=sm_121 -o bench_micro bench_micro.cu && ./bench_micro
+nvcc -O3 -arch=sm_121 -o bench_micro bench_micro.cu && ./bench_micro      # 峰值标定
 nvcc -O3 -arch=sm_121 -lcublas -o cublas_bench cublas_bench.cu && ./cublas_bench
-
-# tile 参数评估（gemm_v4，模板参数化 BM/BN/BK/WN）
-nvcc -O3 -arch=sm_121 -lcublas -o gemm_v4 gemm_v4.cu && ./gemm_v4 4096 4096 4096
+nvcc -O3 -arch=sm_121 -o probe_v7cfg probe_v7cfg.cu && ./probe_v7cfg      # v7 消融探针
+nvcc -O3 -arch=sm_121 -lcuda -o probe_tmaswiz probe_tmaswiz.cu && ./probe_tmaswiz  # TMA swizzle 公式验证
 ```
 
 每个版本的输出包含：
@@ -75,7 +77,7 @@ Step 4 验证（性能双百分比：峰值利用率 + 相对 cuBLAS；精度 vs
 | v4 | tile 参数化评估（4 组配置） | — | — | — | ❌ 假设证伪 |
 | v5 | 加大 BK / 4-stage 多缓冲 | — | — | — | ❌ 假设证伪 |
 | v6 | B 换 x4 ldmatrix / WN=32 | — | — | — | ❌ 假设证伪 |
-| **v7** | **照抄 cuBLAS 配置 + block swizzle** | **54.31** | **45.9%** | **62.4%** | ✅ |
+| v7 | 照抄 cuBLAS 配置 + block swizzle | 54.31 | 45.9% | 62.4% | ✅ |
 | **v8** | TMA + mbarrier full/empty（零 `__syncthreads`） | 59.2 | 50.0% | 68.0% | ✅ |
 | v9 | padded smem 布局消 LDSM bank conflict（A 4路/B 8路→0） | 67.9 | 57.4% | 78.0% | ✅ |
 | v10 | TMA + SWIZZLE_128B + BK=64（nvjet 路线） | 84.1 | 71.1% | 96.6% | ✅ |
@@ -142,6 +144,13 @@ v7 配置：BM=128, BN=256, BK=32，8 warps（256 线程，2×4 排布），每 
 - 4096³ 67.9→**84.1（cuBLAS 96.6%）**、8192³ 75.3→**91.7（95.4%）**、全尺寸 +19–24%；
 - 剩余缺口转移：1024³ 的 30%（SM 填充病，autotune/split-K 地盘）> 2048³ 的 20% > 大形状的 3–5%。
 
+**v10 → v11：epilogue 优化（smem 暂存 + TMA store，+9%）——4096³ 反超 cuBLAS**
+
+- 指示：v10 的 epilogue 消融探针（`bench/probe_epi10.cu`）实测写回是第一大单项瓶颈——2048³ -32%、4096³ -20%（store 碎片化：每线程 2×4B 对散写，实测写带宽仅 ≈183 GB/s；且 1 block/SM 下与 mma 完全串行）；
+- 两个变体同场对比：float2 向量写（5 行改动，小尺寸 +9–39%）与 smem 暂存 + TMA store（4-pass 双缓冲流水 + bulk group 完成跟踪，中大尺寸赢家）——采纳后者，前者保留为 `gemm_v11a.cu`（512³/8192³ 略优，epilogue 风格记为 autotune 维度）；
+- 踩到并修掉一个新 race：smem 从读侧（ldsm）转写侧（暂存）缺屏障，warp 错位时落后 warp 用 C 数据算 mma——**奇数 K 块必触发**（判别实验锁定规律后根因自明）；
+- 实测：4096³ 84.1→**88.9（cuBLAS 87.10 的 102%）**、2048³ +11.5%、1024³ +27%（写回对短 K 的摊薄伤害最大，正是本轮收益来源）；精度全尺寸 + 奇数 K 块回归 + 非方形全 PASS。
+
 ### 核心方法论收获
 
 1. **消融探针是定位指令级瓶颈的唯一手段**（本机 ncu counter 权限被锁）：逐项排除法最终定位到「ldsm 延迟依赖」，这是 Roofline 完全看不到的一层；
@@ -152,12 +161,20 @@ v7 配置：BM=128, BN=256, BK=32，8 warps（256 线程，2×4 排布），每 
 ## 目录结构
 
 ```
-criterion.md        优化守则（四步循环 + 双百分比判定 + 精度标准）
-gemm_v0.cu ~ v11.cu  12 个版本的 GEMM 实现（每个可独立编译运行）
-reports/v0.md~v11.md 每版结论文档（瓶颈→方案→实测→教训）
-bench/bench_micro.cu    峰值算力/带宽压测（标定 100% 标尺）
-bench/cublas_bench.cu   cuBLAS baseline（性能参照）
-bench/probe_v7cfg.cu    v7 配置消融探针（mma/ldsm/sync 逐项排除）
+criterion.md          优化守则（四步循环 + 双百分比判定 + 精度标准）
+hardware.md           GB10 硬件全景（组织架构图 + 全实测参数 + 8 条怪癖 + cuBLAS 引擎地图）
+gemm_v0.cu ~ v11.cu   12 个版本的 GEMM 实现（每个可独立编译运行）
+gemm_v11a.cu          v11 的 float2 写回变体（小尺寸/8192³ 略优）
+reports/v0.md~v11.md  每版完整记录（roofline 指示→方案→实测→关键代码→下一步）
+bench/                基准与探针（每份对应报告中某个具体测量的可复现证据）：
+  bench_micro.cu        峰值算力/带宽标定（118.37 / 255.6）
+  cublas_bench.cu       cuBLAS baseline
+  probe_v7cfg.cu        v7 配置消融（mma/ldsm/sync 逐项排除）
+  probe_ldsm.cu         LDSM bank conflict 微基准（4 路/8 路实测）
+  probe_tmaswiz.cu      TMA SWIZZLE_128B 落位公式逐位验证
+  probe_epi10/11.cu     v10/v11 写回消融
+  probe_sync11.cu       v11 同步协议消融（-17 的定位证据）
+  ...（其余见各报告引用）
 ```
 
 ## License
