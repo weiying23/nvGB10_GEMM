@@ -165,7 +165,7 @@ criterion.md          优化守则（四步循环 + 双百分比判定 + 精度�
 hardware.md           GB10 硬件全景（组织架构图 + 全实测参数 + 8 条怪癖 + cuBLAS 引擎地图）
 gemm_v0.cu ~ v11.cu   12 个版本的 GEMM 实现（每个可独立编译运行）
 gemm_v11a.cu          v11 的 float2 写回变体（小尺寸/8192³ 略优）
-reports/v0.md~v11.md  每版完整记录（roofline 指示→方案→实测→关键代码→下一步）
+reports/v00.md~v11.md  每版完整记录（roofline 指示→方案→实测→关键代码→下一步）
 bench/                基准与探针（每份对应报告中某个具体测量的可复现证据）：
   bench_micro.cu        峰值算力/带宽标定（118.37 / 255.6）
   cublas_bench.cu       cuBLAS baseline
