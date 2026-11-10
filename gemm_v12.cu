@@ -36,12 +36,17 @@ using bf16 = __nv_bfloat16;
 #define BK 64
 #define NUM_STAGES 2
 // 双配置模板：BIG = 128x256（大形状），SMALL = 128x64（小形状填充）
-template <int BM_, int BN_, int WM_, int WN_>
+template <int BM_, int BN_, int WM_, int WN_, int THREADS_ = 256, int BPSM_ = 1>
 struct Cfg {
     static constexpr int BM = BM_, BN = BN_, WM = WM_, WN = WN_;
+    static constexpr int THREADS = THREADS_, BLOCKS_PER_SM = BPSM_;
+    static constexpr int NUM_WARPS = THREADS_ / 32;
     static constexpr int NUM_M = WM_ / 16;
     static constexpr int NUM_N = WN_ / 8;
     static constexpr int NUM_B_CHUNKS = BN_ / 64;
+    static constexpr int WARP_N_COUNT = NUM_B_CHUNKS;          // warp_n 数 = chunk 数
+    static constexpr int WARP_M_COUNT = NUM_WARPS / WARP_N_COUNT;
+    static_assert(WM_ == BM_ / WARP_M_COUNT, "WM must match warp grid");
     static constexpr int A_STAGE_BYTES  = BM_ * 128;
     static constexpr int B_CHUNK_BYTES  = 64 * 128;
     static constexpr int B_STAGE_BYTES  = NUM_B_CHUNKS * B_CHUNK_BYTES;
@@ -98,7 +103,7 @@ __device__ __forceinline__ void tma_store_wait() { asm volatile("cp.async.bulk.w
 __device__ __forceinline__ void fence_proxy_async() { asm volatile("fence.proxy.async.shared::cta;\n"); }
 
 template <typename C>
-__global__ void __launch_bounds__(256, 1) gemm_v12(
+__global__ void __launch_bounds__(C::THREADS, C::BLOCKS_PER_SM) gemm_v12(
     const __grid_constant__ CUtensorMap tma_a,
     const __grid_constant__ CUtensorMap tma_b,
     const __grid_constant__ CUtensorMap tma_c,
@@ -135,12 +140,13 @@ __global__ void __launch_bounds__(256, 1) gemm_v12(
     const int lane = tid % 32;
     const int warp_m = warp / NUM_B_CHUNKS;
     const int warp_n = warp % NUM_B_CHUNKS;   // 天然对应 B chunk
+    static_assert(C::WARP_M_COUNT * C::WARP_N_COUNT == C::NUM_WARPS, "warp grid");
 
     if (tid == 0) {
         #pragma unroll
         for (int i = 0; i < NUM_STAGES; ++i) {
             mbar_init(&full_bar[i], 1);
-            mbar_init(&empty_bar[i], 8);
+            mbar_init(&empty_bar[i], C::NUM_WARPS);
         }
     }
     fence_mbar_init();
@@ -353,24 +359,28 @@ int main(int argc, char** argv) {
     // 分派规则：大 tile 的 block 数 < 48（SM 数）→ 用小 tile 补填充
     using BigCfg = Cfg<128, 256, 64, 64>;
     using SmallCfg = Cfg<128, 64, 16, 64>;
+    using TinyCfg  = Cfg<128, 64, 32, 64, 128, 2>;   // 4 warps × 32 行，双 block/SM
     CK(cudaFuncSetAttribute((gemm_v12<BigCfg>), cudaFuncAttributeMaxDynamicSharedMemorySize, BigCfg::SMEM_BYTES));
     CK(cudaFuncSetAttribute((gemm_v12<SmallCfg>), cudaFuncAttributeMaxDynamicSharedMemorySize, SmallCfg::SMEM_BYTES));
+    CK(cudaFuncSetAttribute((gemm_v12<TinyCfg>), cudaFuncAttributeMaxDynamicSharedMemorySize, TinyCfg::SMEM_BYTES));
     bool use_small = ((M + 127) / 128) * ((N + 255) / 256) < 48;
+    bool use_tiny = false;   // 由扫描结果决定是否启用
 
     dim3 block(256);
     const uint32_t bm = 128, bn = use_small ? 64 : 256;
     const uint32_t num_m_blocks2 = (M + bm - 1) / bm;
     const uint32_t num_n_blocks2 = (N + bn - 1) / bn;
     dim3 grid(num_m_blocks2 * num_n_blocks2);
-    #define LAUNCH(CFG, SMB) gemm_v12<CFG><<<grid, block, SMB>>>(tmap_a, tmap_b, tmap_c, M, N, K)
+    #define LAUNCH(CFG) gemm_v12<CFG><<<grid, dim3(CFG::THREADS), CFG::SMEM_BYTES>>>(tmap_a, tmap_b, tmap_c, M, N, K)
 
     const int iters = 10;
-    for (int i = 0; i < 3; ++i) { if (use_small) LAUNCH(SmallCfg, SmallCfg::SMEM_BYTES); else LAUNCH(BigCfg, BigCfg::SMEM_BYTES); }
+    auto run1 = [&]{ if (use_tiny) LAUNCH(TinyCfg); else if (use_small) LAUNCH(SmallCfg); else LAUNCH(BigCfg); };
+    for (int i = 0; i < 3; ++i) run1();
     CK(cudaDeviceSynchronize());
 
     cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
     cudaEventRecord(s);
-    for (int i = 0; i < iters; ++i) { if (use_small) LAUNCH(SmallCfg, SmallCfg::SMEM_BYTES); else LAUNCH(BigCfg, BigCfg::SMEM_BYTES); }
+    for (int i = 0; i < iters; ++i) run1();
     cudaEventRecord(e); cudaEventSynchronize(e);
     float ms = 0; cudaEventElapsedTime(&ms, s, e); ms /= iters;
 
