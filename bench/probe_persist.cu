@@ -146,7 +146,12 @@ __global__ void __launch_bounds__(C::THREADS, C::BLOCKS_PER_SM) gemm_v13p(
     uint32_t phase[NUM_STAGES] = {0};
     uint32_t prod_empty_phase[NUM_STAGES] = {0};
 
-    for (uint32_t tile = blockIdx.x; tile < num_tiles; tile += 48) {
+    // ★ swizzle-aware 连续分块（hpc-ops 思想）：
+    //   每 block 领一段连续的 swizzle 序 tile，组内连续 tile 共享 B tile → L2 局部性保持
+    const uint32_t tiles_per_block = (num_tiles + 47) / 48;
+    const uint32_t chunk_start = blockIdx.x * tiles_per_block;
+    const uint32_t chunk_end = min(chunk_start + tiles_per_block, num_tiles);
+    for (uint32_t tile = chunk_start; tile < chunk_end; ++tile) {
         // tile → (m,n) swizzle 映射（同 v7）
         const uint32_t group_size = GROUP_M * num_n_blocks;
         const uint32_t group_id = tile / group_size;
@@ -183,7 +188,7 @@ __global__ void __launch_bounds__(C::THREADS, C::BLOCKS_PER_SM) gemm_v13p(
     // ★ persistent 跨 tile 相位追赶：上一 tile 的最后 empty 等待被跳过（不发射→不等），
     //   prod_empty_phase 落后一位——非首 tile 必须在此补等，否则后续 empty-wait 检查错误相位
     if (tid == 0 && num_k_blocks > 0) {
-        if (tile != blockIdx.x) {          // 非首 tile：追赶所有 stage 的 empty 相位
+        if (tile != chunk_start) {          // 非本 chunk 的首个 tile：追赶所有 stage 的 empty 相位
             #pragma unroll
             for (int i = 0; i < NUM_STAGES; ++i) {
                 mbar_wait(&empty_bar[i], prod_empty_phase[i]);
