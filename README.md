@@ -1,4 +1,4 @@
-# nvGB10_GEMM — NVIDIA GB10 上的 BF16 GEMM 优化（v0 → v11）
+# nvGB10_GEMM — NVIDIA GB10 上的 BF16 GEMM 优化（v0 → v13）
 
 在 NVIDIA GB10（DGX Spark，SM121 消费级 Blackwell）上，用纯 CUDA C++ 从零实现 BF16 GEMM，
 经过 11 轮「roofline/消融探针定位 → 假设 → 实测证伪/采纳」迭代，从标量 1.26 TFLOPS 优化到 **88.9 TFLOPS（cuBLAS 87.10 的 102%）**，
@@ -27,8 +27,8 @@
 ## 如何编译与测试
 
 ```bash
-# v0 ~ v7（-lcublas 用于精度对拍）
-nvcc -O3 -arch=sm_121 -lcublas -o gemm_v1 gemm_v1.cu        # v0~v7 同理
+# v0–v7（-lcublas 用于精度对拍）
+nvcc -O3 -arch=sm_121 -lcublas -o gemm_v1 gemm_v1.cu        # v0–v7 同理
 
 # v8 及以后：TMA 需要 -lcuda（tensor map 走驱动 API）
 nvcc -O3 -arch=sm_121 -lcuda -lcublas -o gemm_v11 gemm_v11.cu
@@ -83,6 +83,7 @@ Step 4 验证（性能双百分比：峰值利用率 + 相对 cuBLAS；精度 vs
 | v10 | TMA + SWIZZLE_128B + BK=64（nvjet 路线） | 84.1 | 71.1% | 96.6% | ✅ |
 | v11 | epilogue：smem 暂存 + TMA store | 88.9 | 75.1% | 102% | ✅ |
 | **v12** | **配置族 + 形状分派（小 tile 128×64）** | **82.1** | **69.4%** | **94.3%** | ✅ |
+| **v13** | **主循环 `#pragma unroll 2`（跨迭代调度）+ 测量协议 v2** | **95.0** | **80.2%** | **96.0%** | ✅ |
 
 > **⚠️ "cuBLAS%" 列的口径说明（读数前必看）**：
 > - 该列以 **4096³** 为代表形状，对照 2026-10-21 缓存的 cuBLAS 基线（87.10）；
@@ -179,9 +180,9 @@ v7 配置：BM=128, BN=256, BK=32，8 warps（256 线程，2×4 排布），每 
 ```
 criterion.md          优化守则（四步循环 + 双百分比判定 + 精度标准）
 hardware.md           GB10 硬件全景（组织架构图 + 全实测参数 + 8 条怪癖 + cuBLAS 引擎地图）
-gemm_v0.cu ~ v11.cu   12 个版本的 GEMM 实现（每个可独立编译运行）
+gemm_v0.cu–v13.cu   14 个版本的 GEMM 实现（每个可独立编译运行）
 gemm_v11a.cu          v11 的 float2 写回变体（小尺寸/8192³ 略优）
-reports/v00.md~v11.md  每版完整记录（roofline 指示→方案→实测→关键代码→下一步）
+reports/v00.md–v13.md  每版完整记录（roofline 指示→方案→实测→关键代码→下一步）
 bench/                基准与探针（每份对应报告中某个具体测量的可复现证据）：
   bench_micro.cu        峰值算力/带宽标定（118.37 / 255.6）
   cublas_bench.cu       cuBLAS baseline

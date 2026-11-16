@@ -11,7 +11,18 @@
 template <typename F>
 static float time_ms(F&& f, int iters) {
     cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
-    for (int i=0;i<5;i++) f();                    // warmup
+    // 长热身（协议修订 2026-11-16）：3 次短热身时小形状整个计时区落在 DVFS 时钟
+    // 爬升内（空闲 208MHz → 加速 3003MHz），读数系统性偏低 ≈6% 且散布 ±5%。
+    // 热身改为时间制：持续 kernel 活跃 ≥30ms 后才开始计时。
+    cudaEventRecord(s);
+    for (int i=0;i<100000;i++) {
+        f();
+        if (i % 64 == 63) {
+            cudaEventRecord(e); cudaEventSynchronize(e);
+            float wms=0; cudaEventElapsedTime(&wms,s,e);
+            if (wms > 30.0f) break;   // 累计活跃 ≥30ms
+        }
+    }
     cudaDeviceSynchronize();
     cudaEventRecord(s);
     for (int i=0;i<iters;i++) f();
@@ -56,9 +67,17 @@ static float bench_fp32(cublasHandle_t h, int M, int N, int K) {
     return (float)(flop / (ms/1e3) / 1e12);
 }
 
-int main() {
+int main(int argc, char** argv) {
     cublasHandle_t h;
     cublasCreate(&h);
+    // 支持命令行指定单个形状：cublas_bench M N K（不传则跑默认形状表）
+    if (argc >= 4) {
+        int m = atoi(argv[1]), n = atoi(argv[2]), k = atoi(argv[3]);
+        float b = bench_bf16(h, m, n, k);
+        printf("[M=%d N=%d K=%d] cuBLAS BF16: %.4f TFLOPS\n", m, n, k, b);
+        cublasDestroy(h);
+        return 0;
+    }
     int shapes[][3] = {{4096,4096,4096},{2048,2048,2048},{1024,1024,1024},{8192,8192,8192}};
     printf("shape (M=N=K) | BF16 TFLOPS | FP32(TF32) TFLOPS\n");
     for (auto& s : shapes) {
