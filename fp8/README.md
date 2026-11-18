@@ -63,13 +63,14 @@ SWIZZLE_128B 与现有 ldsm 公式全部复用，K 覆盖翻倍。
 
 ## 3. 分阶段计划（受 fp8/criterion.md 约束——四步循环 + 测量协议 v2 + 阶段门）
 
-| 阶段 | 内容 | 产出 | 风险 |
+| 阶段 | 内容 | 产出 | 状态 |
 |---|---|---|---|
-| **A（本轮）** | fragment 布局 dump 探针：16×32 A + 32×8 B 单 mma vs CPU 参照 | `fp8/probe_fp8_layout.cu` | 低（dump 法一次锁死） |
-| B | 量化 kernel（per-tensor，含动态 abs-max scale） | `fp8/quantize.cu` | 低（hpc-ops 图纸） |
-| C | cuBLASLt FP8 支持探针（定精度参照） | `fp8/probe_cublaslt_fp8.cu` | 未知（引擎可能不存在） |
-| D | fp8 GEMM v1 = v13 骨架 + mma/B 布局替换（per-tensor scale epilogue） | `fp8/gemm_fp8_v1.cu` + `reports/fp8_v1.md` | 中（B 布局/同步细节） |
-| E | blockwise scale v2（主循环逐块乘） | 视 v1 消融定 | 中 |
+| A | fragment 布局 dump 探针 | `fp8/probe_fp8_layout.cu` | ✅ 逐位一致 |
+| B | 量化 kernel（per-tensor + 动态 abs-max + B 转置） | `fp8/quantize.cu` | ✅ 245/221 GB/s |
+| C | cuBLASLt FP8 支持探针 | `fp8/probe_cublaslt_fp8.cu` / `probe_lt_min.cu` | ✅ 引擎可用（8192³ 200.26） |
+| D | fp8 GEMM v1 = v13 骨架 + e4m3 切换 | `fp8/gemm_fp8_v1.cu` + `reports/fp8_v1.md` | ✅ 8192³ 166.5（1.75× BF16，精度逐位一致） |
+| E | v2：配置族 + 差距消融 | — | 待立项 |
+
 
 命名规则：源码与报告都在文件名前缀 `fp8_`，与 BF16 线（v00–v13）并行不互相占用版号。
 
