@@ -1,18 +1,16 @@
 # 编译产物与临时文件
-gemm_v0
-gemm_v1
-gemm_v2
+bf16/gemm_v*
+!bf16/gemm_v*.cu
+fp8/gemm_fp8*
+!fp8/*.cu
 bench/bench_micro
 bench/cublas_bench
 *.o
 *.ptx
-gemm_v3
-gemm_v4
-gemm_v5
-gemm_v7
-gemm_v8
 *.swp
 bench/probe_*
 !bench/probe_*.cu
+fp8/probe_*
+!fp8/probe_*.cu
 *.nsys-rep
 *.sqlite
