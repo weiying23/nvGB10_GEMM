@@ -522,21 +522,50 @@ int main(int argc, char** argv) {
         }
     return 0;
 #endif
-    // 时间制热身（协议 v2）
-    for (int i = 0; i < 3000; ++i) { run1(); if (i % 64 == 63) CK(cudaDeviceSynchronize()); }
-    CK(cudaDeviceSynchronize());
+    // 时间制热身（协议 v2）：kernel 活跃累计 ≥30ms 即停——不写死次数
+    // （写死 3000 次时 8192³ 每轮热身 3.7s，是需求量的 120 倍）
+    {
+        cudaEvent_t ws, we; cudaEventCreate(&ws); cudaEventCreate(&we);
+        cudaEventRecord(ws);
+        int cnt = 0;
+        do {
+            for (int i = 0; i < 32; ++i) run1();
+            cnt += 32;
+            cudaEventRecord(we); cudaEventSynchronize(we);
+            float wms = 0; cudaEventElapsedTime(&wms, ws, we);
+            if (wms > 300.0f) break;   // 大形状需更长热身：8192³ 在 30ms 停点时钟未满（教训实测）
+        } while (cnt < 1000000);
+        CK(cudaDeviceSynchronize());
+        cudaEventDestroy(ws); cudaEventDestroy(we);
+    }
     cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
-    cudaEventRecord(s);
-    const int iters = 20;
+    // 短内核加大迭代（协议 v2 修正 2026-11-18）：计时窗 ≥20ms——
+    // 1024³ 单发仅 11.7μs，20 迭代的计时窗 234μs 太薄，一次干扰占比过大。
+    // 估时用独立事件对，绝不污染正式计时窗口（教训：Record(s) 若先于估时，
+    // 估时那一发 kernel 会被计入正式窗口 → ms 虚高）
+    int iters = 20;
+    {
+        cudaEvent_t es, ee; cudaEventCreate(&es); cudaEventCreate(&ee);
+        cudaEventRecord(es);
+        run1();
+        cudaEventRecord(ee); cudaEventSynchronize(ee);
+        float one = 0; cudaEventElapsedTime(&one, es, ee);
+        if (one > 0.001f && one < 1.0f) {
+            int want = (int)(20.0f / one) + 1;
+            iters = want > 2000 ? 2000 : (want < 20 ? 20 : want);
+        }
+        cudaEventDestroy(es); cudaEventDestroy(ee);
+    }
+    cudaEventRecord(s);                       // 正式计时起点：估时之后
     for (int i = 0; i < iters; ++i) run1();
     cudaEventRecord(e); cudaEventSynchronize(e);
     float ms = 0; cudaEventElapsedTime(&ms, s, e); ms /= iters;
 
     double flop = 2.0 * M * N * K;
     double tflops = flop / (ms / 1e3) / 1e12;
-    printf("[M=%d N=%d K=%d] fp8_v1(128x256 BK128%s): %.3f ms, %.4f TFLOPS "
+    printf("[iters=%d 窗=%.1fms] [M=%d N=%d K=%d] fp8_v1(128x256 BK128%s): %.3f ms, %.4f TFLOPS "
            "(FP8 峰值 235.79 的 %.2f%% | BF16 v13 同形状的 %.2f 倍)\n",
-           M, N, K, SWZ ? "" : " [SWZ=OFF]", ms, tflops, tflops / 235.79 * 100, tflops / 95.04);
+           iters, ms * iters, M, N, K, SWZ ? "" : " [SWZ=OFF]", ms, tflops, tflops / 235.79 * 100, tflops / 95.04);
 
     if (do_check) {
         // CPU 参照（小形状直接对拍，dump 错位分布定位布局 bug）
