@@ -68,7 +68,7 @@ SWIZZLE_128B 与现有 ldsm 公式全部复用，K 覆盖翻倍。
 | A | fragment 布局 dump 探针 | `fp8/probe_fp8_layout.cu` | ✅ 逐位一致 |
 | B | 量化 kernel（per-tensor + 动态 abs-max + B 转置） | `fp8/quantize.cu` | ✅ 245/221 GB/s |
 | C | cuBLASLt FP8 支持探针 | `fp8/probe_cublaslt_fp8.cu` / `probe_lt_min.cu` | ✅ 引擎可用（8192³ 200.26） |
-| D | fp8 GEMM v1 = v13 骨架 + e4m3 切换 | `fp8/gemm_fp8_v1.cu` + `reports/fp8_v1.md` | ✅ 8192³ 166.5（1.75× BF16，精度逐位一致） |
+| D | fp8 GEMM v1 = v13 骨架 + e4m3 切换 | `fp8/gemm_fp8_v1.cu` + `reports/fp8/v01.md` | ✅ 8192³ 164.8（1.73× BF16，精度逐位一致；协议 v2.1 终值） |
 | E | v2：配置族 + 差距消融 | — | 待立项 |
 
 

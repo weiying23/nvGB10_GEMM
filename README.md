@@ -2,7 +2,7 @@
 
 在 NVIDIA GB10（DGX Spark，SM121 消费级 Blackwell）上，用纯 CUDA C++ 从零实现 BF16 GEMM，
 经过 11 轮「roofline/消融探针定位 → 假设 → 实测证伪/采纳」迭代，从标量 1.26 TFLOPS 优化到 **88.9 TFLOPS（cuBLAS 87.10 的 102%）**，
-全程与 cuBLAS 对拍精度（`max_rel_err = 0`，逐位一致）。每轮的完整记录见 `reports/`（v0–v12），
+全程与 cuBLAS 对拍精度（`max_rel_err = 0`，逐位一致）。每轮的完整记录见 `reports/bf16/`（v00–v13）与 `reports/fp8/`（FP8 线），
 硬件全景见 `hardware.md`。
 
 ## 测试运行环境
@@ -52,7 +52,7 @@ nvcc -O3 -arch=sm_121 -lcuda -o probe_tmaswiz probe_tmaswiz.cu && ./probe_tmaswi
 
 ## 优化守则（criterion.md）
 
-每轮迭代严格走四步循环，产出 `reports/vN.md`：
+每轮迭代严格走四步循环，产出 `reports/bf16/vN.md`（FP8 线为 `reports/fp8/vN.md`）：
 
 ```
 Step 1 分析瓶颈（Roofline + 消融探针 + ptxas -v）
@@ -182,7 +182,8 @@ criterion.md          优化守则（四步循环 + 双百分比判定 + 精度�
 hardware.md           GB10 硬件全景（组织架构图 + 全实测参数 + 8 条怪癖 + cuBLAS 引擎地图）
 gemm_v0.cu–v13.cu   14 个版本的 GEMM 实现（每个可独立编译运行）
 gemm_v11a.cu          v11 的 float2 写回变体（小尺寸/8192³ 略优）
-reports/v00.md–v13.md  每版完整记录（roofline 指示→方案→实测→关键代码→下一步）
+reports/bf16/v00.md–v13.md  BF16 线每版完整记录（roofline 指示→方案→实测→关键代码→下一步）
+reports/fp8/v01.md–         FP8 线每版完整记录（同结构）
 bench/                基准与探针（每份对应报告中某个具体测量的可复现证据）：
   bench_micro.cu        峰值算力/带宽标定（118.37 / 255.6）
   cublas_bench.cu       cuBLAS baseline
