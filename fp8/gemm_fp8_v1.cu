@@ -41,13 +41,21 @@ using bf16 = __nv_bfloat16;
     fprintf(stderr, "cublasLt error %d @%d\n", (int)s, __LINE__); exit(1); } } while(0)
 
 // ---- 配置（v13 BigCfg 同款）----
+#ifndef TSZ
+#define TSZ 0
+#endif
+#if TSZ
+constexpr int BM = 128, BN = 128, WM = 32, WN = 64;   // 128x128 对照（WM=128/4 warp_m）
+#else
 constexpr int BM = 128, BN = 256, WM = 64, WN = 64;
+#endif
 constexpr int THREADS = 256, NUM_WARPS = THREADS / 32;
 constexpr int NUM_M = WM / 16;                  // 4：warp tile 内 m16 组
 constexpr int NUM_NG = WN / 8;                  // 8：warp tile 内 n8 组
 constexpr int NUM_B_CHUNKS = BN / 64;           // 4
 constexpr int WARP_N_COUNT = NUM_B_CHUNKS;      // 4
-constexpr int WARP_M_COUNT = NUM_WARPS / WARP_N_COUNT;  // 2
+constexpr int WARP_M_COUNT = NUM_WARPS / WARP_N_COUNT;
+
 static_assert(WM == BM / WARP_M_COUNT, "WM must match warp grid");
 static_assert(WARP_M_COUNT * WARP_N_COUNT == NUM_WARPS, "warp grid");
 
@@ -120,7 +128,10 @@ __global__ void __launch_bounds__(THREADS, 1) gemm_fp8_v1(
 #endif
 
     // ---- block swizzle（同 v13）----
-    constexpr uint32_t GROUP_M = 8;
+#ifndef GM
+#define GM 8
+#endif
+    constexpr uint32_t GROUP_M = GM;
     const uint32_t num_m_blocks = (M + BM - 1) / BM;
     const uint32_t num_n_blocks = (N + BN - 1) / BN;
     const uint32_t bid = blockIdx.x;
