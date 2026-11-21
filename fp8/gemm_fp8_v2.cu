@@ -46,6 +46,11 @@
 
 using bf16 = __nv_bfloat16;
 
+// 消融开关（v03 Step 1 探针）：0=完整 1=去 epilogue 写回 2=去计算(仅装载+空转主循环)
+#ifndef ABLATE
+#define ABLATE 0
+#endif
+
 #ifndef SWZ
 #define SWZ 1   // 1 = SWIZZLE_128B（正常）；0 = 无 swizzle 对照（判别探针）
 #endif
@@ -132,8 +137,11 @@ __global__ void __launch_bounds__(C::THREADS, C::BLOCKS_PER_SM) gemm_fp8_v2(
     const __grid_constant__ CUtensorMap tma_b,
     const __grid_constant__ CUtensorMap tma_c,
     int M, int N, int K, float alpha
-#if defined(NOTMA) || defined(DUMP)
+#if ABLATE || defined(NOTMA) || defined(DUMP)
     , const unsigned char* gA_raw, const unsigned char* gB_raw
+#endif
+#if ABLATE
+    , float* dC_dummy
 #endif
 ) {
     // 配置常量展开（kernel 体与 v1 逐行同构，仅常量来源改为模板）
@@ -291,6 +299,12 @@ __global__ void __launch_bounds__(C::THREADS, C::BLOCKS_PER_SM) gemm_fp8_v2(
         const int gl = lane / 8;                       // B 侧：x4 的 4 矩阵角色 0-3
 
         // ---- 4 个 k32 slice（每 slice：4 A-ldsm.x4 + 4 B-ldsm.x4 + 32 mma）----
+#if ABLATE == 2
+        // 消融：去计算。只跑流水（装载+barrier），ldsm/mma 全跳
+        asm volatile("fence.acq_rel.cta;\n");
+        if (lane == 0) mbar_arrive(&empty_bar[s]);
+        continue;
+#endif
         #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
             // A fragment（寻址与 v13 逐字节同构：sub = ks*2 + atile/2 覆盖 chunk 0-7）
@@ -338,6 +352,21 @@ __global__ void __launch_bounds__(C::THREADS, C::BLOCKS_PER_SM) gemm_fp8_v2(
         if (lane == 0) mbar_arrive(&empty_bar[s]);
     }
 
+#if ABLATE == 1
+    // 消融：去写回。累加器归约保活（写 1 个 float/block），跳过整个 epilogue
+    __syncthreads();
+    {
+        float s = 0;
+        #pragma unroll
+        for (int i = 0; i < NUM_M; ++i)
+            #pragma unroll
+            for (int j = 0; j < NUM_NG; ++j)
+                s += c[i][j][0] + c[i][j][1] + c[i][j][2] + c[i][j][3];
+        if (tid == 0 && s == 12345.678f) dC_dummy[blockIdx.x] = s;   // 条件永假，防 DCE
+    }
+    (void)alpha;
+    return;
+#endif
     // ---- epilogue：v13 同款（4-pass × 32 行 TMA store 流水）+ per-tensor scale ----
     __syncthreads();
     const int crow = lane / 4, ccol = (lane % 4) * 2;
@@ -523,13 +552,34 @@ int main(int argc, char** argv) {
     const uint32_t num_n_blocks = (N + bn_used - 1) / bn_used;
     dim3 grid(num_m_blocks * num_n_blocks);
     auto run1 = [&] {
+        auto extra = [&]() -> void* {
+#if ABLATE
+            static float* dummy = nullptr;
+            if (!dummy) cudaMalloc(&dummy, sizeof(float) * 100000);
+            return dummy;
+#else
+            return nullptr;
+#endif
+        };
         switch (which) {
         case 2: gemm_fp8_v2<SmallCfg><<<grid, SmallCfg::THREADS, SmallCfg::SMEM_BYTES>>>(
-                    tma_a, tma_b, tma_c, M, N, K, alpha); break;
+                    tma_a, tma_b, tma_c, M, N, K, alpha
+#if ABLATE
+                    , nullptr, nullptr, (float*)extra()
+#endif
+); break;
         case 1: gemm_fp8_v2<MidCfg><<<grid, MidCfg::THREADS, MidCfg::SMEM_BYTES>>>(
-                    tma_a, tma_b, tma_c, M, N, K, alpha); break;
+                    tma_a, tma_b, tma_c, M, N, K, alpha
+#if ABLATE
+                    , nullptr, nullptr, (float*)extra()
+#endif
+); break;
         default: gemm_fp8_v2<BigCfg><<<grid, BigCfg::THREADS, BigCfg::SMEM_BYTES>>>(
-                    tma_a, tma_b, tma_c, M, N, K, alpha); break;
+                    tma_a, tma_b, tma_c, M, N, K, alpha
+#if ABLATE
+                    , nullptr, nullptr, (float*)extra()
+#endif
+); break;
         }
     };
 
@@ -609,11 +659,17 @@ int main(int argc, char** argv) {
     double flop = 2.0 * M * N * K;
     double tflops = flop / (ms / 1e3) / 1e12;
     const char* cfg_name = which == 0 ? "128x256" : (which == 1 ? "128x128pow2" : "128x64");
+#if ABLATE == 1
+    printf("[M=%d N=%d K=%d] ablate_epi(%s): %.3f ms, %.4f TFLOPS "
+#elif ABLATE == 2
+    printf("[M=%d N=%d K=%d] ablate_calc(%s): %.3f ms, %.4f TFLOPS "
+#else
     printf("[M=%d N=%d K=%d] fp8_v2(%s): %.3f ms, %.4f TFLOPS "
+#endif
            "(FP8 峰值 235.79 的 %.2f%% | BF16 v13 同形状的 %.2f 倍)\n",
            M, N, K, cfg_name, ms, tflops, tflops / 235.79 * 100, tflops / 95.04);
 
-    if (do_check) {
+    if (do_check && ABLATE == 0) {
         // CPU 参照（小形状直接对拍，dump 错位分布定位布局 bug）
         if ((long)M * N * K <= (long)64 * 1024 * 1024) {
             std::vector<float> hC((size_t)M * N);
