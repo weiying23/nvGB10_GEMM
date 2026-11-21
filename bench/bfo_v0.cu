@@ -83,10 +83,26 @@ int main(int argc, char** argv) {
     dim3 block(16, 16);
     dim3 grid((N + block.x - 1) / block.x, (M + block.y - 1) / block.y);
 
-    // ---- 计时（warmup + 多次取平均）----
-    const int iters = 10;
-    for (int i = 0; i < 3; ++i) gemm_naive<<<grid, block>>>(dA, dB, dC, M, N, K);  // warmup
-    CK(cudaDeviceSynchronize());
+    // ---- 计时（协议 v2.1：时间制热身 ≥30ms + 自适应计时窗 ≥20ms）----
+    int iters = 20;
+    {
+        cudaEvent_t ws_, we_; cudaEventCreate(&ws_); cudaEventCreate(&we_);
+        cudaEventRecord(ws_);
+        int cnt_ = 0; float wms_ = 0.f;
+        do {
+            for (int q = 0; q < 8; ++q) gemm_naive<<<grid, block>>>(dA, dB, dC, M, N, K);
+            cnt_ += 8;
+            cudaEventRecord(we_); cudaEventSynchronize(we_);
+            cudaEventElapsedTime(&wms_, ws_, we_);
+        } while (wms_ < 30.f && cnt_ < 1000000);
+        if (cnt_ > 0 && wms_ > 0.f) {
+            float one_ms_ = wms_ / cnt_;
+            int want_ = (int)(20.0f / one_ms_) + 1;
+            iters = want_ > 2000 ? 2000 : (want_ < 3 ? 3 : want_);   // 慢内核单发即长窗，下限 3
+        }
+        cudaDeviceSynchronize();
+        cudaEventDestroy(ws_); cudaEventDestroy(we_);
+    }
 
     cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
     cudaEventRecord(s);

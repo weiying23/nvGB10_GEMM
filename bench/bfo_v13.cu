@@ -376,9 +376,27 @@ int main(int argc, char** argv) {
     dim3 grid(num_m_blocks2 * num_n_blocks2);
     #define LAUNCH(CFG) gemm_v12<CFG><<<grid, dim3(CFG::THREADS), CFG::SMEM_BYTES>>>(tmap_a, tmap_b, tmap_c, M, N, K)
 
-    const int iters = 10;
+    int iters = 20;
     auto run1 = [&]{ if (use_tiny) LAUNCH(TinyCfg); else if (use_small) LAUNCH(SmallCfg); else LAUNCH(BigCfg); };
-    for (int i = 0; i < 3; ++i) run1();
+    {
+        // 协议 v2.1：时间制热身（kernel 活跃累计 ≥30ms 才开始计时——短内核的 3 次热身落在 DVFS 爬升内）
+        cudaEvent_t ws_, we_; cudaEventCreate(&ws_); cudaEventCreate(&we_);
+        cudaEventRecord(ws_);
+        int cnt_ = 0; float wms_ = 0.f;
+        do {
+            for (int q = 0; q < 8; ++q) { run1(); }
+            cnt_ += 8;
+            cudaEventRecord(we_); cudaEventSynchronize(we_);
+            cudaEventElapsedTime(&wms_, ws_, we_);
+        } while (wms_ < 30.f && cnt_ < 1000000);
+        if (cnt_ > 0 && wms_ > 0.f) {
+            float one_ms_ = wms_ / cnt_;
+            int want_ = (int)(20.0f / one_ms_) + 1;
+            iters = want_ > 2000 ? 2000 : (want_ < 3 ? 3 : want_);   // 慢内核单发即长窗，下限 3
+        }
+        cudaDeviceSynchronize();
+        cudaEventDestroy(ws_); cudaEventDestroy(we_);
+    }
     CK(cudaDeviceSynchronize());
 
     cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
