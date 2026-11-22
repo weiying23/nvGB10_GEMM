@@ -71,7 +71,8 @@ SWIZZLE_128B 与现有 ldsm 公式全部复用，K 覆盖翻倍。
 | D | fp8 GEMM v1 = v13 骨架 + e4m3 切换 | `fp8/gemm_fp8_v1.cu` + `reports/fp8/v01.md` | ✅ 8192³ 164.8（1.73× BF16，精度逐位一致；协议 v2.1 终值） |
 | E | v2：配置族 + 双维分派（填充 × 2 幂病理规避） | `fp8/gemm_fp8_v2.cu` + `reports/fp8/v02.md` | ✅ 512³ +123%、8192³ +3.2%、4096³ 零回归 |
 | F | v3：消融定位（写回 -13.1%）→ C 换 BF16 写出 | `fp8/gemm_fp8_v3.cu` + `reports/fp8/v03.md` | ✅ 2048³ +34%、全形状正收益 |
-| G | v4：8192³ 剩余 -12.5%（BK=64+独立暂存 persistent 方程重算 / BF16 线移植评估） | — | 待立项 |
+| G | v4：8192³ 缺口解耦（消融+四格矩阵）→ 撤销 MidCfg 2 幂规避 | `fp8/gemm_fp8_v4.cu` + `reports/fp8/v04.md` | ✅ 8192³ +5.9%（186.6，cuBLASLt 91.7%） |
+| H | v5：病理 -6.2%（bz swizzle 破译）或 BK=64 4-stage（BigCfg 96KB 可装） | — | 待立项 |
 
 
 命名规则：源码与报告都在文件名前缀 `fp8_`，与 BF16 线（v00–v13）并行不互相占用版号。
