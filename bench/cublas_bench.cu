@@ -1,9 +1,13 @@
 // cuBLAS baseline：测 BF16 / FP32(TF32) 的 GEMM 有效算力，作为固定参照（只测一次）
+// 2026-11-25 修复：随机数据填充替代 memset 0——GB10 功耗受限，零数据位翻转率低 →
+// 时钟更高 → GEMM 快 2-3%（实测 2048³：零填充 96.3 vs 随机 93.3）。基线工具必须与
+// 被测 kernel（随机数据）同分布，否则基线虚高。
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #define CK(x) do { auto e=(x); if(e!=cudaSuccess){fprintf(stderr,"CUDA err %d @%d\n",e,__LINE__);return 1;} } while(0)
@@ -33,11 +37,34 @@ static float time_ms(F&& f, int iters) {
 }
 
 // 测一个形状的 BF16 GEMM (C = A@B, 列主序)
+
+// 随机 bf16 填充（hash(index)，值域约 [-2,2)，混合正负）
+__global__ void fill_rand_bf16(__nv_bfloat16* p, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (; i < n; i += stride) {
+        unsigned h = (unsigned)(i * 2654435761u) ^ (unsigned)(i >> 32);
+        h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+        // 符号/指数/尾数全部取自 hash——指数 120..127（值域 |x|∈[0.008,2)），
+        // 保证位翻转率与真实 [-1,1] 随机数据一致（指数位也要翻）
+        unsigned short bits = (unsigned short)(((h & 0x8000))
+                                               | ((120u + ((h >> 13) & 0x7u)) << 7)
+                                               | ((h >> 5) & 0x7Fu));
+        __nv_bfloat16 v;
+        memcpy(&v, &bits, 2);
+        p[i] = v;
+    }
+}
+static void fill_rand(__nv_bfloat16* p, size_t n) {
+    int blocks = (int)((n / 256) + 1);
+    fill_rand_bf16<<<blocks > 65535 ? 65535 : blocks, 256>>>(p, n);
+}
+
 static float bench_bf16(cublasHandle_t h, int M, int N, int K) {
     size_t sa = (size_t)M*K*2, sb=(size_t)K*N*2, sc=(size_t)M*N*2;
     __nv_bfloat16 *A, *B, *C;
     CK(cudaMalloc(&A,sa)); CK(cudaMalloc(&B,sb)); CK(cudaMalloc(&C,sc));
-    CK(cudaMemset(A,0,sa)); CK(cudaMemset(B,0,sb)); CK(cudaMemset(C,0,sc));
+    fill_rand(A, sa/2); fill_rand(B, sb/2); fill_rand(C, sc/2);   // 随机数据（勿 memset 0，见文件头）
     float alpha=1.0f, beta=0.0f;
     auto run = [&]{
         cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
